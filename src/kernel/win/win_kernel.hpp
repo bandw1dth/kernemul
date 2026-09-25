@@ -4,6 +4,8 @@
 #include "process.hpp"
 #include "exception.hpp"
 #include "defs.hpp"
+#include "guest_clock.hpp"
+#include "timer_queue.hpp"
 #include "modules/ntoskrnl.hpp"
 #include "boot_seed.hpp"
 #include "registry.hpp"
@@ -50,10 +52,28 @@ struct win_kernel_state : kernel_state
 
 	// One per machine: the trampoline it returns through is a single address.
 	guest_caller calls;
+	win::guest_clock clock;
+	win::timer_queue timers;
+	std::recursive_mutex timer_mutex;
+	struct queued_dpc { addr_t address, routine, context, arg1, arg2; };
+	std::deque<queued_dpc> dpcs;
+	std::mutex dpc_mutex;
+	std::recursive_mutex dpc_dispatch_mutex;
+	std::atomic<bool> dpc_running{false};
+	std::atomic<std::size_t> dpc_count{0};
+	std::atomic<std::size_t> timer_count{0};
+	std::unordered_map<std::size_t, addr_t> dpc_stacks;
+	bool insert_dpc(emu_object<_KDPC> dpc, addr_t arg1, addr_t arg2);
+	bool remove_dpc(addr_t address);
+	void dispatch_dpcs(vcpu& cpu, bool flush = false);
+	bool set_timer(emu_object<_KTIMER> timer, std::int64_t due, std::uint64_t period, addr_t dpc);
+	bool cancel_timer(addr_t timer);
+	void update_time();
+	NTSTATUS delay_thread(vcpu& cpu, std::int64_t due);
 
 	std::unordered_map<addr_t, std::uint64_t> views;
 
-	std::int64_t boot_time = static_cast<std::int64_t>(win_system_time());
+	std::int64_t boot_time = static_cast<std::int64_t>(clock.sample().system_time);
 
 	// Read out of the mapped ntoskrnl rather than hardcoded: guest_fs_dir is a build time switch
 	// across image sets that are already different builds, so the image is the only authority.
@@ -158,6 +178,7 @@ struct win_kernel_state : kernel_state
 			"KUSER_SHARED_DATA", true);
 		kuser_shared_data.write(make_default_kuser_shared_data(1));
 		kuser_shared_data.field(&_KUSER_SHARED_DATA::NtBuildNumber).write(nt_build_number);
+		update_time();
 	}
 
 	// Nothing in a mapped module is ever executed, so the imports are not resolved either.
@@ -595,6 +616,11 @@ public:
 		kernel_.sys_proc->set_scheduler(&scheduler_);
 		kernel_.sys_proc->set_emulator(this);
 		kernel_.set_emulator(this);
+		scheduler_.set_kernel_work([this](vcpu& cpu) {
+			return kernel_.dpc_count.load() && !kernel_.dpc_running.load() && irql(cpu) < dispatch_level;
+		}, [this](vcpu& cpu) { kernel_.dispatch_dpcs(cpu); }, [this] {
+			return kernel_.timer_count.load() || kernel_.dpc_count.load() || kernel_.dpc_running.load();
+		});
 		excp_ = std::make_shared<win::win_exception>(kernel_);
 
 		emu_->hook_insn(0, std::numeric_limits<addr_t>::max(), hook_insn_t::syscall,
@@ -921,6 +947,7 @@ public:
 	}
 
 private:
+	void timekeeper_tick() override { kernel_.update_time(); }
 	win_kernel_state kernel_;
 };
 

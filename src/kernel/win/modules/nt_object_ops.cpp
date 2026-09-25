@@ -5,15 +5,27 @@
 #include "../process_params.hpp"
 #include "../string.hpp"
 #include "../types.hpp"
+#include "../callback_registry.hpp"
 #include "../../../util/string.hpp"
 #include "../../../util/log.hpp"
 #include <array>
+#include <exception>
+#include <limits>
+#include <memory>
+#include <new>
+#include <optional>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace
 {
 
 constexpr std::size_t namespace_object_body_size = 0x10;
+constexpr std::uint16_t ob_flt_registration_version = 0x0100;
+constexpr std::uint32_t ob_operation_handle_create = 0x00000001;
+constexpr std::uint32_t ob_operation_handle_duplicate = 0x00000002;
+constexpr NTSTATUS status_flt_instance_altitude_collision = 0xC01C0011;
 
 struct directory_host final : win_object {};
 
@@ -23,11 +35,42 @@ struct ob_callback_registration_t
 {
 	std::uint16_t   version;
 	std::uint16_t   operation_count;
-	std::uint32_t   flags;
+	std::uint32_t   padding;
 	_UNICODE_STRING altitude;
 	addr_t          registration_context;
 	addr_t          operation_registration;
 };
+
+std::optional<std::u16string> callback_altitude(addr_space& space,
+	const _UNICODE_STRING& altitude)
+{
+	if (!altitude.Length || (altitude.Length % sizeof(char16_t)) != 0
+		|| (altitude.MaximumLength % sizeof(char16_t)) != 0
+		|| altitude.MaximumLength < altitude.Length || !guest_va(altitude.Buffer))
+		return std::nullopt;
+
+	auto value = win::read_unicode_string(space, altitude);
+	if (value.empty())
+		return std::nullopt;
+
+	return value;
+}
+
+bool is_supported_object_type(addr_space& space, const proc_module& mod,
+	const addr_t object_type, const addr_t type)
+{
+	if (!object_type || !type)
+		return false;
+
+	for (const auto symbol : { "PsProcessType", "PsThreadType", "ExDesktopObjectType" })
+	{
+		const auto global = mod.find_symbol(symbol);
+		if (global && object_type == *global)
+			return space.read_mem<addr_t>(*global) == type;
+	}
+
+	return false;
+}
 
 struct ob_operation_registration_t
 {
@@ -142,61 +185,114 @@ void modules::register_ntoskrnl_object_ops(win_kernel_state& state, proc_module&
 
 	state.redirect_ntzw(mod, "Close", close_fn);
 
-	// Nothing here opens a handle down the path that would notify one, so a filter sees no traffic.
+	// Records belong to this emulator's redirected handlers; callback delivery remains unsupported.
+	auto ob_callbacks = std::make_shared<win::callbacks::registry<addr_t,
+		win::callbacks::ob_registration>>(0x10000);
 	state.redirect(mod, "ObRegisterCallbacks",
-		[&objs = state.objs](vcpu& cpu, emu_object<void> callback_registration,
+		[ob_callbacks, &mod](vcpu& cpu, emu_object<void> callback_registration,
 			emu_object<addr_t> registration_handle) -> NTSTATUS
 		{
 			if (!callback_registration || !registration_handle)
 				return STATUS_INVALID_PARAMETER;
 
-			auto& space = *cpu.curr_addr_space();
-			const emu_object<ob_callback_registration_t> registration(space,
-				callback_registration.address());
-
-			const auto reg = registration.read();
-			const auto altitude = narrow_wstring(win::read_unicode_string(
-				emu_object<_UNICODE_STRING>(space, registration.address()
-					+ offsetof(ob_callback_registration_t, altitude))));
-
-			THREAD_LOG_INFO("ObRegisterCallbacks(version={}, altitude='{}', {} operation(s))",
-				reg.version, altitude, reg.operation_count);
-
-			for (std::uint16_t i = 0; i < reg.operation_count; ++i)
+			win::callbacks::registry<addr_t,
+				win::callbacks::ob_registration>::insert_result inserted{
+					.status = win::callbacks::insert_status::identifier_exhausted,
+				};
+			std::string altitude_log;
+			std::uint16_t operation_count{};
+			try
 			{
-				const emu_object<ob_operation_registration_t> op(space,
-					reg.operation_registration + i * sizeof(ob_operation_registration_t));
+				auto& space = *cpu.curr_addr_space();
+				const auto reg = emu_object<ob_callback_registration_t>(space,
+					callback_registration.address()).read();
 
-				const auto entry = op.read();
-				const auto type = space.read_mem<addr_t>(entry.object_type);
+				if (reg.version != ob_flt_registration_version || !reg.operation_count
+					|| !reg.operation_registration)
+					return STATUS_INVALID_PARAMETER;
 
-				THREAD_LOG_INFO("  operation[{}]: type=0x{:X} (at 0x{:X}), operations=0x{:X}, "
-					"pre=0x{:X}, post=0x{:X}",
-					i, type, entry.object_type, entry.operations,
-					entry.pre_operation, entry.post_operation);
+				const auto altitude = callback_altitude(space, reg.altitude);
+				if (!altitude)
+					return STATUS_INVALID_PARAMETER;
+				altitude_log = narrow_wstring(*altitude);
+				operation_count = reg.operation_count;
+
+				win::callbacks::ob_registration copied{
+					.version = reg.version,
+					.context = reg.registration_context,
+					.altitude = *altitude,
+				};
+				copied.operations.reserve(reg.operation_count);
+
+				constexpr auto valid_operations = ob_operation_handle_create
+					| ob_operation_handle_duplicate;
+				for (std::uint16_t i = 0; i < reg.operation_count; ++i)
+				{
+					const auto offset = static_cast<addr_t>(i)
+						* sizeof(ob_operation_registration_t);
+					if (reg.operation_registration > std::numeric_limits<addr_t>::max() - offset)
+						return STATUS_INVALID_PARAMETER;
+
+					const auto entry = emu_object<ob_operation_registration_t>(space,
+						reg.operation_registration + offset).read();
+					if (!entry.object_type || !entry.operations
+						|| (entry.operations & ~valid_operations)
+						|| (!entry.pre_operation && !entry.post_operation))
+						return STATUS_INVALID_PARAMETER;
+
+					const auto type = space.read_mem<addr_t>(entry.object_type);
+					if (!is_supported_object_type(space, mod, entry.object_type, type))
+						return STATUS_INVALID_PARAMETER;
+
+					copied.operations.push_back({
+						.object_type = entry.object_type,
+						.type = type,
+						.operations = entry.operations,
+						.pre_operation = entry.pre_operation,
+						.post_operation = entry.post_operation,
+					});
+				}
+
+				inserted = ob_callbacks->insert(std::move(copied),
+					[&registration_handle](const addr_t handle)
+					{
+						registration_handle.write(handle);
+					});
+			}
+			catch (const std::bad_alloc&)
+			{
+				return STATUS_INSUFFICIENT_RESOURCES;
+			}
+			catch (const std::exception&)
+			{
+				return STATUS_INVALID_PARAMETER;
 			}
 
-			const auto count = reg.operation_count;
-
-			const std::uint8_t body[sizeof(addr_t)] = {};
-			const auto handle = objs.create_object(0, body, sizeof(body), {},
-				prot_rw | prot_supervisor);
-
-			if (!handle)
+			switch (inserted.status)
+			{
+			case win::callbacks::insert_status::altitude_collision:
+				return status_flt_instance_altitude_collision;
+			case win::callbacks::insert_status::output_write_failed:
+				return STATUS_ACCESS_VIOLATION;
+			case win::callbacks::insert_status::identifier_exhausted:
 				return STATUS_INSUFFICIENT_RESOURCES;
-
-			registration_handle.write(handle);
-
-			THREAD_LOG_WARN("ObRegisterCallbacks(0x{:X}, {} operation(s)) -> 0x{:X}: nothing here "
-				"notifies an object callback", callback_registration.address(), count, handle);
-
-			return STATUS_SUCCESS;
+			case win::callbacks::insert_status::success:
+				THREAD_LOG_WARN("ObRegisterCallbacks(0x{:X}, altitude='{}', {} operation(s)) -> "
+					"0x{:X}: object callback delivery is unsupported",
+					callback_registration.address(), altitude_log, operation_count, inserted.id);
+				return STATUS_SUCCESS;
+			}
+			return STATUS_UNSUCCESSFUL;
 		});
 
-	state.redirect(mod, "ObUnRegisterCallbacks", [](vcpu&, const addr_t registration_handle)
-	{
-		THREAD_LOG_INFO("ObUnRegisterCallbacks(0x{:X})", registration_handle);
-	});
+	state.redirect(mod, "ObUnRegisterCallbacks",
+		[ob_callbacks](vcpu&, const addr_t registration_handle)
+		{
+			const bool removed = ob_callbacks->unregister(registration_handle);
+			THREAD_LOG_INFO("ObUnRegisterCallbacks(0x{:X}) -> {}{}",
+				registration_handle, removed ? "removed" : "unknown handle",
+				removed ? "; object callback delivery is unsupported" : "");
+		});
 
 	// Nothing here builds a type index table, so the kind comes from the host object instead.
 	state.redirect(mod, "ObGetObjectType",

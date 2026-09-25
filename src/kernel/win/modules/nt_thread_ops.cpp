@@ -8,6 +8,7 @@
 
 void modules::register_ntoskrnl_thread_ops(win_kernel_state& state, proc_module& mod)
 {
+	auto* st = &state;
 	auto* sys_proc = state.sys_proc.get();
 
 	// Nothing of this stub is executed; threads are given it as their return address.
@@ -76,7 +77,7 @@ void modules::register_ntoskrnl_thread_ops(win_kernel_state& state, proc_module&
 
 	// Nothing here queues APCs, so an alertable wait always runs its course.
 	state.redirect(mod, "KeDelayExecutionThread",
-		[](vcpu& cpu, const std::uint8_t wait_mode, const std::uint8_t alertable,
+		[st](vcpu& cpu, [[maybe_unused]] const std::uint8_t wait_mode, [[maybe_unused]] const std::uint8_t alertable,
 			emu_object<std::int64_t> interval) -> NTSTATUS
 		{
 			if (!interval)
@@ -85,19 +86,7 @@ void modules::register_ntoskrnl_thread_ops(win_kernel_state& state, proc_module&
 				return STATUS_INVALID_PARAMETER;
 			}
 
-			const auto ticks = interval.read();
-			const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-				win_ticks(ticks < 0 ? -ticks : ticks - win_system_time()));
-
-			THREAD_LOG_INFO("KeDelayExecutionThread(wait_mode={}, alertable={}, interval={}): {}ms",
-				wait_mode, alertable, ticks, ms.count());
-
-			if (ms > std::chrono::milliseconds::zero())
-				thread_scheduler::sleep_current(cpu, ms);
-			else
-				thread_scheduler::yield_current(cpu);
-
-			return STATUS_SUCCESS;
+			return st->delay_thread(cpu, interval.read());
 		});
 
 	// Nothing here schedules by priority, so moving it changes only what the guest reads back.

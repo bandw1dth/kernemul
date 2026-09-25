@@ -5,10 +5,12 @@
 #include "../util/log.hpp"
 #include "process.hpp"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <optional>
 #include <memory>
 #include <mutex>
@@ -131,7 +133,7 @@ public:
 protected:
 	id_type id_;
 	std::shared_ptr<class process> process_;
-	bool started_ = false;
+	std::atomic<bool> started_{false};
 	std::vector<reg_val> values_;
 
 private:
@@ -189,6 +191,21 @@ class thread_scheduler
 {
 public:
 	thread_scheduler() = default;
+	void set_kernel_work(std::function<bool(vcpu&)> pending, std::function<void(vcpu&)> dispatch,
+		std::function<bool()> alive)
+	{
+		work_pending_ = std::move(pending);
+		dispatch_work_ = std::move(dispatch);
+		work_alive_ = std::move(alive);
+	}
+	void request_kernel_work()
+	{
+		{ std::scoped_lock lock(mtx_); }
+		cv_.notify_all();
+		if (emu_)
+			for (const auto& cpu : emu_->cpus()) cpu->try_stop();
+	}
+	bool stopped() const { std::scoped_lock lock(mtx_); return stopped_; }
 
 	std::shared_ptr<thread> create_thread(vcpu& cpu, const addr_t start_addr,
 		std::shared_ptr<process> proc, thread::id_type id,
@@ -285,11 +302,13 @@ public:
 
 	static void yield_current(vcpu& cpu)
 	{
+		if (cpu.in_dpc) throw std::runtime_error("DPC cannot block or yield");
 		cpu.stop();
 	}
 
 	static void sleep_current(vcpu& cpu, const std::chrono::milliseconds ms)
 	{
+		if (cpu.in_dpc) throw std::runtime_error("DPC cannot sleep");
 		if (const auto t = cpu.thread())
 			t->sleep_for(ms);
 
@@ -339,6 +358,25 @@ public:
 		{
 			if (stopped_ || nothing_left(cpu))
 				return nullptr;
+
+			// Borrow a parked context for kernel work, without making its wait runnable.
+			// The callback restores registers before this context is saved again.
+			if (work_pending_ && work_pending_(cpu))
+			{
+				const auto available = std::ranges::find_if(ready_queue_,
+					[](const auto& t) { return t->is_started(); });
+				auto work_thread = available == ready_queue_.end() ? nullptr : *available;
+				if (work_thread) ready_queue_.erase(available);
+				cpu.set_thread(work_thread);
+				lock.unlock();
+				if (work_thread) resume(cpu, *work_thread);
+				dispatch_work_(cpu);
+				if (work_thread) work_thread->save(cpu);
+				lock.lock();
+				cpu.set_thread(nullptr);
+				if (work_thread) ready_queue_.push_back(std::move(work_thread));
+				if (stopped_ || nothing_left(cpu)) return nullptr;
+			}
 
 			if (const auto it = first_runnable(cpu); it != ready_queue_.end())
 			{
@@ -405,6 +443,7 @@ private:
 	// Only a running thread creates threads, so none queued or running means nothing to wait for.
 	bool nothing_left(vcpu& cpu) const
 	{
+		if (work_alive_ && work_alive_()) return false;
 		if (!ready_queue_.empty())
 			return false;
 
@@ -422,6 +461,9 @@ private:
 	std::condition_variable cv_;
 	class emu* emu_ = nullptr;
 	bool stopped_ = false;
+	std::function<bool(vcpu&)> work_pending_;
+	std::function<void(vcpu&)> dispatch_work_;
+	std::function<bool()> work_alive_;
 };
 
 // Here rather than in the class: waking the scheduler needs it to be a complete type.

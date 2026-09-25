@@ -256,7 +256,7 @@ void modules::register_ntoskrnl_iocp_ops(win_kernel_state& state, proc_module& m
 		});
 
 	state.redirect_ntzw(mod, "RemoveIoCompletion",
-		[port_from_handle](vcpu& cpu, const std::uint64_t handle,
+		[st, port_from_handle](vcpu& cpu, const std::uint64_t handle,
 			emu_object<addr_t> key_context, emu_object<addr_t> apc_context,
 			emu_object<_IO_STATUS_BLOCK> io_status_block,
 			emu_object<std::int64_t> timeout) -> NTSTATUS
@@ -276,7 +276,7 @@ void modules::register_ntoskrnl_iocp_ops(win_kernel_state& state, proc_module& m
 			{
 				THREAD_LOG_WARN("NtRemoveIoCompletion(0x{:X}): the port is empty, and nothing "
 					"here blocks on one -> STATUS_TIMEOUT (timeout={})",
-					handle, win::read_timeout(timeout).timed ? "given" : "none");
+					handle, win::read_timeout(timeout, st->clock.sample()).timed ? "given" : "none");
 
 				return STATUS_TIMEOUT;
 			}
@@ -303,7 +303,7 @@ void modules::register_ntoskrnl_iocp_ops(win_kernel_state& state, proc_module& m
 		});
 
 	state.redirect_ntzw(mod, "RemoveIoCompletionEx",
-		[port_from_handle](vcpu& cpu, const std::uint64_t handle,
+		[st, port_from_handle](vcpu& cpu, const std::uint64_t handle,
 			emu_object<file_io_completion_information_t> entries, const std::uint32_t count,
 			emu_object<std::uint32_t> removed_out, emu_object<std::int64_t> timeout,
 			const bool alertable) -> NTSTATUS
@@ -347,7 +347,7 @@ void modules::register_ntoskrnl_iocp_ops(win_kernel_state& state, proc_module& m
 			{
 				THREAD_LOG_WARN("NtRemoveIoCompletionEx(0x{:X}, alertable={}): the port is empty, "
 					"and nothing here blocks on one -> STATUS_TIMEOUT (timeout={})",
-					handle, alertable, win::read_timeout(timeout).timed ? "given" : "none");
+					handle, alertable, win::read_timeout(timeout, st->clock.sample()).timed ? "given" : "none");
 
 				return STATUS_TIMEOUT;
 			}

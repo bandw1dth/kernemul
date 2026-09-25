@@ -509,12 +509,13 @@ void modules::register_ntoskrnl_dispatch_ops(win_kernel_state& state, proc_modul
 			THREAD_LOG_WARN("{}: nothing delivers an APC, so an alertable wait runs its course",
 				releasing ? "NtReleaseKeyedEvent" : "NtWaitForKeyedEvent");
 
-		const auto when = win::read_timeout(timeout);
+		const auto when = win::read_timeout(timeout, st->clock.sample());
 
 		win_thread::wait_state wait{};
 		wait.objects = { wait_on };
 		wait.deadline = when.deadline;
 		wait.timed = when.timed;
+		wait.monotonic = when.monotonic;
 
 		THREAD_LOG_INFO("{}(handle=0x{:X}, key=0x{:X}): posted 0x{:X}, waiting on 0x{:X}",
 			releasing ? "NtReleaseKeyedEvent" : "NtWaitForKeyedEvent",

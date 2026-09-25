@@ -346,25 +346,13 @@ void modules::register_ntoskrnl_task_ops(win_kernel_state& state, proc_module& m
 		return STATUS_SUCCESS;
 	};
 
-	auto delay_execution = [](vcpu& cpu, const bool alertable,
+	auto delay_execution = [st](vcpu& cpu, [[maybe_unused]] const bool alertable,
 		emu_object<std::int64_t> delay_interval) -> NTSTATUS
 	{
 		if (!delay_interval)
 			return STATUS_INVALID_PARAMETER;
 
-		const auto ticks = delay_interval.read();
-		const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-			win_ticks(ticks < 0 ? -ticks : ticks - win_system_time()));
-
-		THREAD_LOG_INFO("NtDelayExecution(alertable={}, interval={}): {}ms",
-			alertable, ticks, ms.count());
-
-		if (ms > std::chrono::milliseconds::zero())
-			thread_scheduler::sleep_current(cpu, ms);
-		else
-			thread_scheduler::yield_current(cpu);
-
-		return STATUS_SUCCESS;
+		return st->delay_thread(cpu, delay_interval.read());
 	};
 
 	auto query_thread = [st](vcpu& cpu, const std::uint64_t thread_handle,
@@ -412,7 +400,7 @@ void modules::register_ntoskrnl_task_ops(win_kernel_state& state, proc_module& m
 
 			// Nothing accounts cpu time, so the only honest figure is that none has been charged.
 			kernel_user_times_t times{};
-			times.create_time = static_cast<std::int64_t>(win_system_time());
+			times.create_time = static_cast<std::int64_t>(st->clock.sample().system_time);
 
 			emu_object<kernel_user_times_t>(space, thread_information).write(times);
 
@@ -788,7 +776,7 @@ void modules::register_ntoskrnl_task_ops(win_kernel_state& state, proc_module& m
 		return STATUS_SUCCESS;
 	};
 
-	auto wait_for_alert = [](vcpu& cpu, const addr_t address,
+	auto wait_for_alert = [st](vcpu& cpu, const addr_t address,
 		emu_object<std::int64_t> timeout) -> NTSTATUS
 	{
 		const auto t = std::dynamic_pointer_cast<win_thread>(cpu.thread());
@@ -803,11 +791,12 @@ void modules::register_ntoskrnl_task_ops(win_kernel_state& state, proc_module& m
 			return STATUS_SUCCESS;
 		}
 
-		const auto when = win::read_timeout(timeout);
+		const auto when = win::read_timeout(timeout, st->clock.sample());
 
 		win_thread::wait_state wait{};
 		wait.deadline = when.deadline;
 		wait.timed = when.timed;
+		wait.monotonic = when.monotonic;
 
 		THREAD_LOG_INFO("NtWaitForAlertByThreadId(0x{:X}): parked {}",
 			address, wait.timed ? "with a timeout" : "with no timeout");

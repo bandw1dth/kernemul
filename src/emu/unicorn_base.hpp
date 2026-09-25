@@ -55,6 +55,7 @@ public:
 
 	void run() override
 	{
+		execution_failed_ = false;
 		const bool nested = running_.load() != 0;
 		for (;;)
 		{
@@ -72,7 +73,10 @@ public:
 			in_hook_ = hooks;
 
 			if (res != UC_ERR_OK)
+			{
+				execution_failed_ = true;
 				LOG_ERR("cpu {}: emulation stopped at 0x{:X}: {}", id(), pc, uc_strerror(res));
+			}
 
 			if (redirect_.exchange(false))
 			{
@@ -120,6 +124,8 @@ public:
 	{
 		uc_ctl_flush_tlb(uc_);
 	}
+	bool execution_failed() const override { return execution_failed_; }
+	bool execution_failed_ = false;
 
 	void reg_read(reg_t reg, void* value, std::size_t size) override = 0;
 	void reg_write(reg_t reg, const void* value, std::size_t size) override = 0;

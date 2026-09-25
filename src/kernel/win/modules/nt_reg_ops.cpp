@@ -4,8 +4,13 @@
 #include "../status.hpp"
 #include "../string.hpp"
 #include "../types.hpp"
+#include "../callback_registry.hpp"
 #include "../../../util/log.hpp"
 #include "../../../util/string.hpp"
+#include <exception>
+#include <memory>
+#include <optional>
+#include <new>
 #include <cstring>
 #include <vector>
 #include <string_view>
@@ -18,6 +23,23 @@ struct registry_key_host final : win_object
 	std::shared_ptr<win_registry_key> key;
 	std::string path;
 };
+
+constexpr NTSTATUS status_flt_instance_altitude_collision = 0xC01C0011;
+
+std::optional<std::u16string> callback_altitude(addr_space& space,
+	const _UNICODE_STRING& altitude)
+{
+	if (!altitude.Length || (altitude.Length % sizeof(char16_t)) != 0
+		|| (altitude.MaximumLength % sizeof(char16_t)) != 0
+		|| altitude.MaximumLength < altitude.Length || !guest_va(altitude.Buffer))
+		return std::nullopt;
+
+	auto value = win::read_unicode_string(space, altitude);
+	if (value.empty())
+		return std::nullopt;
+
+	return value;
+}
 
 enum key_information_class : std::uint32_t
 {
@@ -753,33 +775,81 @@ void modules::register_ntoskrnl_reg_ops(win_kernel_state& state, proc_module& mo
 			return STATUS_SUCCESS;
 		});
 
-	// Nothing notifies a registry callback, so a driver filtering the registry sees no traffic.
+	// The records live with these per-emulator handlers; registry callback delivery is unsupported.
+	auto cm_callbacks = std::make_shared<win::callbacks::registry<std::int64_t,
+		win::callbacks::cm_registration>>(1);
 	state.redirect(mod, "CmRegisterCallbackEx",
-		[](vcpu&, const addr_t function, emu_object<_UNICODE_STRING> altitude,
+		[cm_callbacks](vcpu& cpu, const addr_t function, emu_object<_UNICODE_STRING> altitude,
 			const addr_t driver, const addr_t context,
-			emu_object<std::int64_t> cookie, [[maybe_unused]] const addr_t reserved) -> NTSTATUS
+			emu_object<std::int64_t> cookie, const addr_t reserved) -> NTSTATUS
 		{
-			if (!cookie)
+			if (!function || !altitude || !driver || !cookie || reserved)
 				return STATUS_INVALID_PARAMETER;
 
-			// Monotonic so that two registrations never share one, which is all a caller can tell.
-			static std::int64_t next_cookie = 1;
-			const auto value = next_cookie++;
+			win::callbacks::registry<std::int64_t,
+				win::callbacks::cm_registration>::insert_result inserted{
+					.status = win::callbacks::insert_status::identifier_exhausted,
+				};
+			std::string altitude_log;
+			try
+			{
+				auto& space = *cpu.curr_addr_space();
+				const auto altitude_value = callback_altitude(space, altitude.read());
+				if (!altitude_value)
+					return STATUS_INVALID_PARAMETER;
+				altitude_log = narrow_wstring(*altitude_value);
 
-			cookie.write(value);
+				win::callbacks::cm_registration copied{
+					.function = function,
+					.context = context,
+					.altitude = *altitude_value,
+					.driver = driver,
+				};
+				inserted = cm_callbacks->insert(std::move(copied),
+					[&cookie](const std::int64_t value)
+					{
+						cookie.write(value);
+					});
+			}
+			catch (const std::bad_alloc&)
+			{
+				return STATUS_INSUFFICIENT_RESOURCES;
+			}
+			catch (const std::exception&)
+			{
+				return STATUS_INVALID_PARAMETER;
+			}
 
-			THREAD_LOG_WARN("CmRegisterCallbackEx(function=0x{:X}, altitude='{}', driver=0x{:X}, "
-				"context=0x{:X}) -> cookie={}: nothing notifies a registry callback",
-				function, narrow_wstring(win::read_unicode_string(altitude)), driver, context, value);
-
-			return STATUS_SUCCESS;
+			switch (inserted.status)
+			{
+			case win::callbacks::insert_status::altitude_collision:
+				return status_flt_instance_altitude_collision;
+			case win::callbacks::insert_status::output_write_failed:
+				return STATUS_ACCESS_VIOLATION;
+			case win::callbacks::insert_status::identifier_exhausted:
+				return STATUS_INSUFFICIENT_RESOURCES;
+			case win::callbacks::insert_status::success:
+				THREAD_LOG_WARN("CmRegisterCallbackEx(function=0x{:X}, altitude='{}', driver=0x{:X}, "
+					"context=0x{:X}) -> cookie={}: registry callback delivery is unsupported",
+					function, altitude_log, driver, context, inserted.id);
+				return STATUS_SUCCESS;
+			}
+			return STATUS_UNSUCCESSFUL;
 		});
 
-	state.redirect(mod, "CmUnRegisterCallback", [](vcpu&, const std::int64_t cookie) -> NTSTATUS
-	{
-		THREAD_LOG_INFO("CmUnRegisterCallback(cookie={})", cookie);
-		return STATUS_SUCCESS;
-	});
+	state.redirect(mod, "CmUnRegisterCallback",
+		[cm_callbacks](vcpu&, const std::int64_t cookie) -> NTSTATUS
+		{
+			if (!cm_callbacks->unregister(cookie))
+			{
+				THREAD_LOG_WARN("CmUnRegisterCallback(cookie={}) -> STATUS_INVALID_PARAMETER", cookie);
+				return STATUS_INVALID_PARAMETER;
+			}
+
+			THREAD_LOG_INFO("CmUnRegisterCallback(cookie={}) -> removed; registry callback delivery "
+				"is unsupported", cookie);
+			return STATUS_SUCCESS;
+		});
 
 	// Nothing here notices a registry write, so the watch is accepted and the event stays unset.
 	state.redirect_ntzw(mod, "NotifyChangeKey",

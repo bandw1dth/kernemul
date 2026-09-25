@@ -2,10 +2,13 @@
 #include "arch.hpp"
 #include "calling_conv.hpp"
 #include "emu.hpp"
+#include "guest_call_completion.hpp"
 #include <cstdint>
 #include <mutex>
 #include <span>
 #include <vector>
+#include <unordered_map>
+#include <stdexcept>
 
 inline void guest_tail_call(vcpu& cpu, const addr_t routine,
 	const std::span<const std::uint64_t> args)
@@ -22,7 +25,7 @@ class guest_caller
 {
 public:
 	std::uint64_t call(vcpu& cpu, addr_t routine, std::span<const std::uint64_t> args,
-		std::size_t scratch = 0)
+		std::size_t scratch = 0, const std::function<bool()>& cancelled = {})
 	{
 		const auto a = cpu.arch();
 		const auto regs = a->regs();
@@ -45,7 +48,23 @@ public:
 			conv.write_arg(cpu, i, args[i]);
 
 		cpu.set_pc(routine);
-		cpu.run();
+		guest_call_completions::invocation invocation(completions_, cpu.id());
+		try
+		{
+			do
+			{
+				cpu.run();
+				if (cancelled && (cancelled() || cpu.execution_failed()))
+					throw std::runtime_error("guest callback stopped before returning");
+				if (!cancelled || invocation.returned()) break;
+			} while (true);
+		}
+		catch (...)
+		{
+			for (std::size_t i = 0; i < regs.size(); ++i)
+				cpu.reg_write(regs[i], &saved[i], a->reg_size(regs[i]));
+			throw;
+		}
 
 		const auto result = conv.read_ret(cpu);
 
@@ -61,6 +80,7 @@ public:
 	}
 
 private:
+	guest_call_completions completions_;
 	// Clear of the handler frame, so a routine reading past its arguments stays off it.
 	static constexpr addr_t red_zone = 0x100;
 
@@ -72,7 +92,10 @@ private:
 			trampoline_ = cpu.curr_addr_space()->alloc(0x1000, prot_rx | prot_supervisor);
 
 			cpu.emu()->hook_code(trampoline_, trampoline_,
-				[](vcpu& c, addr_t, std::size_t) { c.stop(); });
+				[this](vcpu& c, addr_t, std::size_t) {
+					completions_.complete(c.id());
+					c.stop();
+				});
 		});
 
 		return trampoline_;

@@ -89,33 +89,79 @@ public:
 	// to run flat out rather than paying a context save and restore every tick for nothing.
 	void run_all(const std::chrono::milliseconds runtime = default_thread_runtime)
 	{
-		std::atomic<std::size_t> live{cpus().size()};
+		std::atomic<std::size_t> live{0};
+		std::atomic<bool> failed{false};
+		std::mutex failure_mutex;
+		std::exception_ptr failure;
+		const auto record_failure = [&] {
+			std::scoped_lock lock(failure_mutex);
+			if (!failure) failure = std::current_exception();
+			failed = true;
+		};
 		std::vector<std::thread> hosts;
 		hosts.reserve(cpus().size());
-
-		for (const auto& cpu : cpus())
+		try
 		{
-			hosts.emplace_back([this, cpu, &live]
+			for (const auto& cpu : cpus())
 			{
-				set_log_cpu(cpu.get());
-
-				scheduler_.run(*cpu);
-				--live;
-			});
+				++live;
+				try
+				{
+					hosts.emplace_back([this, cpu, &live, &record_failure]
+					{
+						try
+						{
+							set_log_cpu(cpu.get());
+							scheduler_.run(*cpu);
+						}
+						catch (...) { record_failure(); }
+						--live;
+					});
+				}
+				catch (...) { --live; throw; }
+			}
 		}
+		catch (...) { record_failure(); }
 
+		auto next_quantum = std::chrono::steady_clock::now() + runtime;
 		while (live.load())
 		{
-			std::this_thread::sleep_for(runtime);
-
-			scheduler_.preempt_for_waiting(cpus());
+			if (failed.load())
+			{
+				scheduler_.stop();
+				// Repeat until joined: a CPU might not yet have entered run() when
+				// the first cancellation was requested.
+				for (const auto& cpu : cpus())
+				{
+					try { cpu->try_stop(); }
+					catch (...) { record_failure(); }
+				}
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			if (failed.load()) continue;
+			try
+			{
+				timekeeper_tick();
+				const auto now = std::chrono::steady_clock::now();
+				if (now >= next_quantum)
+				{
+					scheduler_.preempt_for_waiting(cpus());
+					next_quantum = now + runtime;
+				}
+			}
+			catch (...) { record_failure(); }
 		}
 
-		for (auto& host : hosts)
-			host.join();
+		for (auto& host : hosts) host.join();
+		if (failure)
+		{
+			scheduler_.stop();
+			std::rethrow_exception(failure);
+		}
 	}
 
 protected:
+	virtual void timekeeper_tick() {}
 	std::shared_ptr<class emu> emu_;
 	std::shared_ptr<os_exception> excp_;
 	thread_scheduler scheduler_;
@@ -191,6 +237,7 @@ struct kernel_state
 					{
 						THREAD_LOG_ERR("{}!{} faulted: {}", m->name,
 							name_at(*m, addr), e.what());
+						if (cpu.in_dpc) { cpu.dpc_failed = true; cpu.stop(); }
 					}
 
 					// Stopping the cpu moves the pc on some architectures, so it is put back.
@@ -201,6 +248,14 @@ struct kernel_state
 				}
 
 				THREAD_LOG_ERR("unimplemented function {}!{}", m->name, name_at(*m, addr));
+				if (cpu.in_dpc)
+				{
+					// The checked caller will stop the scheduler after restoring context.
+					// This must also work on an idle CPU with no associated thread.
+					cpu.dpc_failed = true;
+					cpu.stop();
+					return;
+				}
 
 				// Left running, the thread would be rescheduled onto this address forever.
 				if (const auto t = cpu.thread())

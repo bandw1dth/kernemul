@@ -231,7 +231,7 @@ void modules::register_ntoskrnl_lpc_ops(win_kernel_state& state, proc_module& mo
 		});
 
 	state.redirect_ntzw(mod, "AlpcSendWaitReceivePort",
-		[port_from_handle](vcpu& cpu, const std::uint64_t port_handle, const std::uint32_t flags,
+		[st, port_from_handle](vcpu& cpu, const std::uint64_t port_handle, const std::uint32_t flags,
 			emu_object<_PORT_MESSAGE> send_message,
 			[[maybe_unused]] const addr_t send_message_attributes,
 			emu_object<_PORT_MESSAGE> receive_message, emu_object<std::uint64_t> buffer_length,
@@ -276,7 +276,7 @@ void modules::register_ntoskrnl_lpc_ops(win_kernel_state& state, proc_module& mo
 			{
 				THREAD_LOG_WARN("NtAlpcSendWaitReceivePort(0x{:X}): nothing queued, and nothing "
 					"here blocks on a port -> STATUS_TIMEOUT (timeout={})",
-					port_handle, win::read_timeout(timeout).timed ? "given" : "none");
+					port_handle, win::read_timeout(timeout, st->clock.sample()).timed ? "given" : "none");
 
 				return STATUS_TIMEOUT;
 			}

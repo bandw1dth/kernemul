@@ -18,15 +18,16 @@ constexpr std::uint32_t wait_all = 0;
 constexpr std::size_t maximum_wait_objects = 64;
 
 win_thread::wait_state make_wait(std::vector<addr_t> objects,
-	const std::uint32_t wait_type, const emu_object<std::int64_t>& timeout)
+	const std::uint32_t wait_type, const emu_object<std::int64_t>& timeout, win::clock_sample now)
 {
-	const auto when = win::read_timeout(timeout);
+	const auto when = win::read_timeout(timeout, now);
 
 	win_thread::wait_state w{};
 	w.objects = std::move(objects);
 	w.all = wait_type == wait_all;
 	w.deadline = when.deadline;
 	w.timed = when.timed;
+	w.monotonic = when.monotonic;
 
 	return w;
 }
@@ -38,7 +39,7 @@ void modules::register_ntoskrnl_wait_ops(win_kernel_state& state, proc_module& m
 {
 	auto* st = &state;
 
-	auto begin_wait = [](vcpu& cpu, std::vector<addr_t> objects, const std::uint32_t wait_type,
+	auto begin_wait = [st](vcpu& cpu, std::vector<addr_t> objects, const std::uint32_t wait_type,
 		const emu_object<std::int64_t>& timeout, const std::string_view who) -> NTSTATUS
 	{
 		const auto t = std::dynamic_pointer_cast<win_thread>(cpu.thread());
@@ -49,7 +50,7 @@ void modules::register_ntoskrnl_wait_ops(win_kernel_state& state, proc_module& m
 			return STATUS_INVALID_PARAMETER;
 		}
 
-		auto wait = make_wait(std::move(objects), wait_type, timeout);
+		auto wait = make_wait(std::move(objects), wait_type, timeout, st->clock.sample());
 
 		THREAD_LOG_INFO("{}: waiting on {} object(s), {}{}",
 			who, wait.objects.size(), wait.all ? "all of them, " : "",

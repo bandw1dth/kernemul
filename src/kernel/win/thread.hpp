@@ -34,20 +34,23 @@ public:
 	{
 		std::vector<addr_t> objects;
 		bool all = false;
-		// Absolute guest time. Only meaningful with `timed`, since zero is a legitimate deadline.
-		std::int64_t deadline = 0;
+		// The selected guest clock domain; zero is a legitimate deadline.
+		std::uint64_t deadline = 0;
 		bool timed = false;
+		bool monotonic = false;
 
 		// Filled in by whoever satisfied the wait; reading the objects is the signaller's job.
 		bool satisfied = false;
 		NTSTATUS status = 0;
+		NTSTATUS timeout_status = STATUS_TIMEOUT;
 	};
 
 	void begin_wait(wait_state w);
 
-	[[nodiscard]] bool is_waiting() const { return wait_.has_value(); }
+	[[nodiscard]] bool is_waiting() const { std::scoped_lock lock(wait_mutex_); return wait_.has_value(); }
 	[[nodiscard]] bool waiting_on(const addr_t object) const
 	{
+		std::scoped_lock lock(wait_mutex_);
 		return wait_ && std::ranges::find(wait_->objects, object) != wait_->objects.end();
 	}
 
@@ -98,6 +101,8 @@ public:
 	[[nodiscard]] bool is_user_mode() const override { return !is_system_thread(); }
 
 protected:
+	mutable std::recursive_mutex wait_mutex_;
+	std::uint64_t wait_now(bool monotonic) const;
 	std::optional<wait_state> wait_;
 	bool alerted_ = false;
 	std::uint32_t suspend_count_ = 0;

@@ -27,6 +27,10 @@ public:
 	virtual void stop() = 0;
 
 	virtual void try_stop() { stop(); }
+	virtual bool execution_failed() const { return false; }
+	// Owned by this vCPU's host thread, for checked deferred guest callbacks only.
+	bool in_dpc = false;
+	bool dpc_failed = false;
 	virtual void flush_tlb() = 0;
 
 	virtual void reg_read(reg_t reg, void* value, std::size_t size) = 0;

@@ -12,6 +12,8 @@
 #include "../../../util/string.hpp"
 #include <algorithm>
 #include <cstring>
+#include <mutex>
+#include <stdexcept>
 #include <vector>
 
 namespace
@@ -32,24 +34,50 @@ constexpr std::size_t callback_object_list_head = 0x10;
 constexpr std::size_t callback_object_allow_multiple = 0x20;
 constexpr std::uint32_t callback_object_signature = 0x6C6C6143;
 
+struct callback_registration_record final
+{
+	addr_t function = 0;
+	addr_t context = 0;
+	std::mutex mutex;
+	bool active = true;
+};
+
 struct callback_host final : win_object
 {
-	struct registration
-	{
-		addr_t function = 0;
-		addr_t context = 0;
-	};
-
-	std::vector<registration> registrations;
+	std::mutex registrations_mutex;
+	std::vector<std::shared_ptr<callback_registration_record>> registrations;
 	bool allow_multiple = false;
 };
 
 struct callback_registration_host final : win_object
 {
+	std::mutex mutex;
 	addr_t callback_object_addr = 0;
-	addr_t function = 0;
-	addr_t context = 0;
+	std::shared_ptr<callback_registration_record> registration;
 };
+
+addr_t create_callback_object(win_kernel_state& state, addr_space& space,
+	const std::string& key, const bool allow_multiple)
+{
+	auto host = std::make_shared<callback_host>();
+	host->allow_multiple = allow_multiple;
+
+	const std::vector<std::uint8_t> body(callback_object_size, 0);
+	const auto addr = state.objs.create_object(0, body.data(), body.size(),
+		std::move(host), prot_rw | prot_supervisor);
+	if (!addr)
+		return 0;
+
+	const auto list_head = addr + callback_object_list_head;
+	space.write_mem<std::uint32_t>(addr, callback_object_signature);
+	space.write_mem<addr_t>(list_head, list_head);
+	space.write_mem<addr_t>(list_head + sizeof(addr_t), list_head);
+	space.write_mem<std::uint8_t>(addr + callback_object_allow_multiple,
+		allow_multiple ? 1 : 0);
+
+	state.objs.register_named_object(key, addr);
+	return addr;
+}
 
 // A triage dump: signature, the machine that made it, and where the consumer looks for each
 // part. Recovered from what reads one back, so the offsets are named only where they are used.
@@ -97,10 +125,27 @@ constexpr std::uint32_t image_verification_subtype(const image_verification_type
 
 }
 
-// The rest of what a driver reaches for on its way up; none of these callbacks is ever invoked.
+// The rest of what a driver reaches for on its way up.
 void modules::register_ntoskrnl_misc_ops(win_kernel_state& state, proc_module& mod)
 {
 	auto* st = &state;
+
+	// Windows precreates these objects. Keep their initial creation references for the
+	// kernel's lifetime; each guest open receives its own additional reference below.
+	// The per-kernel namespace also makes repeated module registration idempotent.
+	for (const auto name : { "\\Callback\\PowerState", "\\Callback\\SetSystemTime" })
+	{
+		const auto key = object_namespace_key(name);
+		if (const auto existing = state.objs.lookup_named_object(key))
+		{
+			if (!state.objs.get_object<callback_host>(existing))
+				throw std::runtime_error("system callback name identifies another object");
+			continue;
+		}
+
+		if (!create_callback_object(state, state.kernel_space(), key, true))
+			throw std::runtime_error("out of memory creating system callback object");
+	}
 
 	// A bugcheck is the end of the machine, so it is the end of the guest here.
 	state.redirect(mod, "KeBugCheckEx",
@@ -250,22 +295,20 @@ void modules::register_ntoskrnl_misc_ops(win_kernel_state& state, proc_module& m
 
 			const auto narrow_name = narrow_wstring(name);
 
-			// Only an unnamed open has nothing to look up and nothing to make.
-			if (narrow_name.empty() && !create)
+			// Executive callback objects require a name, whether they are opened or created.
+			if (narrow_name.empty())
 			{
-				THREAD_LOG_WARN("ExCreateCallback(create=false): no name to open");
+				THREAD_LOG_WARN("ExCreateCallback: callback objects must be named");
 				return STATUS_UNSUCCESSFUL;
 			}
 
-			const auto key = narrow_name.empty()
-				? std::string{}
-				: object_namespace_key(narrow_name);
+			const auto key = object_namespace_key(narrow_name);
 
-			if (!key.empty())
+			if (const auto existing = st->objs.lookup_named_object(key))
 			{
-				if (const auto existing = st->objs.lookup_named_object(key);
-					existing && st->objs.get_object<callback_host>(existing))
+				if (st->objs.get_object<callback_host>(existing))
 				{
+					st->objs.reference_object(existing);
 					callback_object_out.write(existing);
 
 					THREAD_LOG_INFO("ExCreateCallback('{}', create={}) -> 0x{:X} (existing)",
@@ -273,32 +316,25 @@ void modules::register_ntoskrnl_misc_ops(win_kernel_state& state, proc_module& m
 
 					return STATUS_SUCCESS;
 				}
+
+				THREAD_LOG_WARN("ExCreateCallback('{}'): name already identifies another object",
+					narrow_name);
+				return create ? STATUS_OBJECT_NAME_COLLISION : STATUS_OBJECT_TYPE_MISMATCH;
 			}
 
-			auto host = std::make_shared<callback_host>();
-			host->allow_multiple = allow_multiple_callbacks;
+			if (!create)
+			{
+				THREAD_LOG_INFO("ExCreateCallback('{}', create=false) -> not found", narrow_name);
+				return STATUS_OBJECT_NAME_NOT_FOUND;
+			}
 
-			const std::vector<std::uint8_t> body(callback_object_size, 0);
-			const auto addr = st->objs.create_object(0, body.data(), body.size(),
-				std::move(host), prot_rw | prot_supervisor);
+			const auto addr = create_callback_object(*st, space, key, allow_multiple_callbacks);
 
 			if (!addr)
 			{
 				THREAD_LOG_ERR("ExCreateCallback: out of memory");
 				return STATUS_INSUFFICIENT_RESOURCES;
 			}
-
-			const auto list_head = addr + callback_object_list_head;
-
-			space.write_mem<std::uint32_t>(addr, callback_object_signature);
-			space.write_mem<addr_t>(list_head, list_head);
-			space.write_mem<addr_t>(list_head + sizeof(addr_t), list_head);
-			space.write_mem<std::uint8_t>(addr + callback_object_allow_multiple,
-				allow_multiple_callbacks ? 1 : 0);
-
-			// Named, so the next open of the same name is the same object rather than a second one.
-			if (!key.empty())
-				st->objs.register_named_object(key, addr);
 
 			callback_object_out.write(addr);
 
@@ -321,6 +357,8 @@ void modules::register_ntoskrnl_misc_ops(win_kernel_state& state, proc_module& m
 				return 0;
 			}
 
+			std::scoped_lock object_lock(object->registrations_mutex);
+
 			if (!object->registrations.empty() && !object->allow_multiple)
 			{
 				THREAD_LOG_WARN("ExRegisterCallback: 0x{:X} does not allow multiple callbacks",
@@ -328,10 +366,13 @@ void modules::register_ntoskrnl_misc_ops(win_kernel_state& state, proc_module& m
 				return 0;
 			}
 
+			auto registration = std::make_shared<callback_registration_record>();
+			registration->function = callback_function;
+			registration->context = callback_context;
+
 			auto host = std::make_shared<callback_registration_host>();
 			host->callback_object_addr = callback_object_addr;
-			host->function = callback_function;
-			host->context = callback_context;
+			host->registration = registration;
 
 			const std::uint8_t body[sizeof(addr_t)] = {};
 			const auto addr = st->objs.create_object(0, body, sizeof(body),
@@ -343,7 +384,7 @@ void modules::register_ntoskrnl_misc_ops(win_kernel_state& state, proc_module& m
 				return 0;
 			}
 
-			object->registrations.push_back({callback_function, callback_context});
+			object->registrations.push_back(std::move(registration));
 
 			THREAD_LOG_INFO("ExRegisterCallback(object=0x{:X}, function=0x{:X}, context=0x{:X}) -> 0x{:X}",
 				callback_object_addr, callback_function, callback_context, addr);
@@ -356,7 +397,15 @@ void modules::register_ntoskrnl_misc_ops(win_kernel_state& state, proc_module& m
 		{
 			const auto host = st->objs.get_object<callback_registration_host>(callback_registration);
 
-			if (!host || !host->callback_object_addr)
+			if (!host)
+			{
+				THREAD_LOG_WARN("ExUnregisterCallback: 0x{:X} is not a live callback registration",
+					callback_registration);
+				return;
+			}
+
+			std::scoped_lock registration_lock(host->mutex);
+			if (!host->callback_object_addr)
 			{
 				THREAD_LOG_WARN("ExUnregisterCallback: 0x{:X} is not a live callback registration",
 					callback_registration);
@@ -365,20 +414,27 @@ void modules::register_ntoskrnl_misc_ops(win_kernel_state& state, proc_module& m
 
 			const auto object_addr = host->callback_object_addr;
 			const auto object = st->objs.get_object<callback_host>(object_addr);
+			const auto registration = host->registration;
 
-			if (!object)
+			if (!object || !registration)
 			{
 				THREAD_LOG_WARN("ExUnregisterCallback: 0x{:X} outlived its callback object 0x{:X}",
 					callback_registration, object_addr);
 				return;
 			}
 
+			std::scoped_lock object_lock(object->registrations_mutex);
+			{
+				std::scoped_lock registration_lock(registration->mutex);
+				registration->active = false;
+			}
+
 			auto& registrations = object->registrations;
 
 			const auto it = std::ranges::find_if(registrations,
-				[&host](const callback_host::registration& entry)
+				[&registration](const auto& entry)
 				{
-					return entry.function == host->function && entry.context == host->context;
+					return entry == registration;
 				});
 
 			if (it != registrations.end())
@@ -389,8 +445,84 @@ void modules::register_ntoskrnl_misc_ops(win_kernel_state& state, proc_module& m
 			host->callback_object_addr = 0;
 
 			THREAD_LOG_INFO("ExUnregisterCallback(0x{:X}): function 0x{:X} off object 0x{:X}, "
-				"{} left", callback_registration, host->function, object_addr,
+				"{} left", callback_registration, registration->function, object_addr,
 				registrations.size());
+		});
+
+	state.redirect(mod, "ExNotifyCallback",
+		[st](vcpu& cpu, const addr_t callback_object_addr, const addr_t argument1,
+			const addr_t argument2)
+		{
+			const auto object = st->objs.get_object<callback_host>(callback_object_addr);
+
+			if (!object)
+			{
+				THREAD_LOG_WARN("ExNotifyCallback: 0x{:X} is not a callback object",
+					callback_object_addr);
+				return;
+			}
+
+			std::vector<std::shared_ptr<callback_registration_record>> snapshot;
+			{
+				std::scoped_lock lock(object->registrations_mutex);
+				snapshot = object->registrations;
+			}
+
+			std::size_t delivered = 0;
+			for (const auto& registration : snapshot)
+			{
+				const std::uint64_t args[] = {
+					registration->context, argument1, argument2
+				};
+				const auto caller = cpu.thread();
+				const auto win_caller = std::dynamic_pointer_cast<win_thread>(caller);
+				const bool was_waiting = win_caller && win_caller->is_waiting();
+				const auto sleep_before = caller ? caller->sleep_until() : thread::time_point{};
+				const auto scheduler = st->sys_proc->scheduler();
+
+				{
+					std::scoped_lock lock(registration->mutex);
+					if (!registration->active)
+						continue;
+				}
+
+				// Passing this gate admits an in-flight delivery. Unregister suppresses entries
+				// still waiting in snapshots; it does not drain guest code already in flight, since
+				// waiting across this scheduler can deadlock.
+
+				try
+				{
+					st->calls.call(cpu, registration->function, args, 0, [&]
+					{
+						// Nested guest calls cannot yet suspend and resume their host continuation.
+						// Check deadlines as well as wait state so even a sleep that has already
+						// expired cannot silently attach itself to the restored outer caller.
+						if ((win_caller && !was_waiting && win_caller->is_waiting())
+							|| (caller && caller->sleep_until() != sleep_before))
+						{
+							if (scheduler) scheduler->stop();
+							cpu.stop();
+							throw std::runtime_error("ExNotifyCallback: blocking guest callbacks are unsupported");
+						}
+						return cpu.dpc_failed || (scheduler && scheduler->stopped())
+							|| (caller && caller->is_finished());
+					});
+				}
+				catch (...)
+				{
+					// The kernel redirect wrapper logs exceptions and otherwise resumes execution.
+					// Stop both layers before rethrowing so neither later callbacks nor the
+					// restored caller can run after a failed or blocking callback.
+					if (scheduler) scheduler->stop();
+					cpu.stop();
+					throw;
+				}
+				++delivered;
+			}
+
+			THREAD_LOG_INFO("ExNotifyCallback(object=0x{:X}, argument1=0x{:X}, argument2=0x{:X}): "
+				"delivered to {} registrations", callback_object_addr, argument1, argument2,
+				delivered);
 		});
 
 	state.redirect(mod, "IoCreateDevice",

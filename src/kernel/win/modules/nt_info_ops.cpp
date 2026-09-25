@@ -23,10 +23,9 @@ void modules::register_ntoskrnl_info_ops(win_kernel_state& state, proc_module& m
 	auto* m = &mod;
 
 	state.redirect(mod, "KeQueryPerformanceCounter",
-		[](vcpu&, emu_object<std::int64_t> frequency) -> std::int64_t
+		[st](vcpu&, emu_object<std::int64_t> frequency) -> std::int64_t
 		{
-			const auto now = std::chrono::steady_clock::now().time_since_epoch();
-			const auto ticks = std::chrono::duration_cast<win_ticks>(now).count();
+			const auto ticks = static_cast<std::int64_t>(st->clock.sample().interrupt_time);
 
 			if (frequency)
 				frequency.write(perf_frequency);
@@ -44,12 +43,12 @@ void modules::register_ntoskrnl_info_ops(win_kernel_state& state, proc_module& m
 	});
 
 	// The precise form reads the same clock as KUSER_SHARED_DATA, not the value cached there.
-	auto system_time = [](vcpu&, emu_object<std::int64_t> current_time)
+	auto system_time = [st](vcpu&, emu_object<std::int64_t> current_time)
 	{
 		if (!current_time)
 			return;
 
-		const auto now = static_cast<std::int64_t>(win_system_time());
+		const auto now = static_cast<std::int64_t>(st->clock.sample().system_time);
 		current_time.write(now);
 
 		THREAD_LOG_INFO("KeQuerySystemTime() -> {}", now);

@@ -346,12 +346,12 @@ void modules::register_ntoskrnl_sysinfo_ops(win_kernel_state& state, proc_module
 	auto* st = &state;
 
 	state.redirect_ntzw(mod, "QuerySystemTime",
-		[](vcpu&, emu_object<std::int64_t> system_time) -> NTSTATUS
+		[st](vcpu&, emu_object<std::int64_t> system_time) -> NTSTATUS
 		{
 			if (!system_time)
 				return STATUS_INVALID_PARAMETER;
 
-			const auto now = static_cast<std::int64_t>(win_system_time());
+			const auto now = static_cast<std::int64_t>(st->clock.sample().system_time);
 			system_time.write(now);
 
 			THREAD_LOG_INFO("NtQuerySystemTime() -> {}", now);
@@ -360,14 +360,13 @@ void modules::register_ntoskrnl_sysinfo_ops(win_kernel_state& state, proc_module
 		});
 
 	state.redirect_ntzw(mod, "QueryPerformanceCounter",
-		[](vcpu&, emu_object<std::int64_t> performance_counter,
+		[st](vcpu&, emu_object<std::int64_t> performance_counter,
 			emu_object<std::int64_t> performance_frequency) -> NTSTATUS
 		{
 			if (!performance_counter)
 				return STATUS_INVALID_PARAMETER;
 
-			const auto now = std::chrono::steady_clock::now().time_since_epoch();
-			const auto ticks = std::chrono::duration_cast<win_ticks>(now).count();
+			const auto ticks = static_cast<std::int64_t>(st->clock.sample().interrupt_time);
 
 			performance_counter.write(ticks);
 
@@ -429,7 +428,7 @@ void modules::register_ntoskrnl_sysinfo_ops(win_kernel_state& state, proc_module
 			if (length < sizeof(system_time_of_day_information_t))
 				return STATUS_INFO_LENGTH_MISMATCH;
 
-			const auto now = static_cast<std::int64_t>(win_system_time());
+			const auto now = static_cast<std::int64_t>(st->clock.sample().system_time);
 
 			system_time_of_day_information_t info{};
 			info.boot_time = st->boot_time;

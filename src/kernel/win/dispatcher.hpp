@@ -1,12 +1,16 @@
 #pragma once
 #include "defs.hpp"
 #include "types.hpp"
+#include "guest_clock.hpp"
 #include "../../emu/object.hpp"
 #include <chrono>
 #include <cstdint>
+#include <mutex>
 
 namespace win
 {
+inline std::recursive_mutex dispatcher_mutex;
+inline thread_local bool in_dpc_callback = false;
 
 // KOBJECTS. The guest reads these back: the verifier checks an object header before touching it.
 enum dispatcher_type : std::uint8_t
@@ -86,18 +90,20 @@ inline void set_state_at(addr_space& space, const addr_t object, const std::int3
 // Null is no timeout, negative an interval from now in 100ns ticks, positive absolute guest time.
 struct timeout
 {
-	std::int64_t deadline = 0;
+	std::uint64_t deadline = 0;
 	bool timed = false;
+	bool monotonic = false;
 };
 
-[[nodiscard]] inline timeout read_timeout(const emu_object<std::int64_t>& value)
+[[nodiscard]] inline timeout read_timeout(const emu_object<std::int64_t>& value, clock_sample now)
 {
 	if (!value)
 		return {};
 
 	const auto ticks = value.read();
 
-	return { ticks < 0 ? static_cast<std::int64_t>(win_system_time()) - ticks : ticks, true };
+	return { ticks < 0 ? saturated_add(now.interrupt_time,
+		std::uint64_t{0} - static_cast<std::uint64_t>(ticks)) : static_cast<std::uint64_t>(ticks), true, ticks < 0 };
 }
 
 // Nothing here keeps a wait queue: a thread that cannot proceed is entered again at the same call.
