@@ -25,13 +25,15 @@ exists. This work replaces isolated return-value handlers with stateful services
 
 `tests/scripts/build-drivers.ps1` builds small x64 conformance guest images using
 the installed Visual C++ tools and WDK (SDK version can be passed explicitly).
-It does not install a Windows driver. Run fixtures from PowerShell with:
+It does not install a Windows driver. Run fixtures from PowerShell 7 (`pwsh`) with:
 
 ```powershell
 .\tests\scripts\build-drivers.ps1
 .\tests\scripts\run-conformance.ps1 -Driver timer_conformance
 .\tests\scripts\run-conformance.ps1 -Driver callback_conformance
 .\tests\scripts\run-conformance.ps1 -Driver registration_conformance
+.\tests\scripts\run-conformance.ps1 -Driver thread_notify_conformance
+.\tests\scripts\run-conformance.ps1 -Driver thread_notify_boundaries
 .\tests\scripts\run-model-tests.ps1
 .\tests\scripts\run-negative-tests.ps1
 ```
@@ -53,7 +55,8 @@ versions. Do not load the unsigned fixture into the host as part of this workflo
 
 ## Follow-on work
 
-1. Typed process/thread/image registrations and delivery at real lifecycle operations.
+1. Extend the classic system-thread lifecycle delivery to process creation, image
+   mapping, Ex thread modes, and target-context remote termination.
 2. Object/registry pre/post operation delivery using the retained registrations.
 3. Coherent process-local handles and guest EPROCESS.ObjectTable representation.
 4. Memory invariants across MMU, PFN, MDL, allocations, and guest-visible metadata.

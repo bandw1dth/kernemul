@@ -70,6 +70,12 @@ public:
 	void set_exit_status(const NTSTATUS status) { exit_status_ = status; }
 	[[nodiscard]] NTSTATUS exit_status() const noexcept { return exit_status_; }
 
+	// Host/boot seeded threads do not synthesize a create event. Only a committed
+	// PsCreateSystemThread transitions to live_guest before publication.
+	enum class notify_origin { host_seeded, live_guest };
+	notify_origin notification_origin = notify_origin::host_seeded;
+	bool exit_notification_started = false; // Owned by the executing target CPU.
+
 	// Neither answer needs guest memory, which is why the scheduler can ask.
 	[[nodiscard]] bool is_ready(vcpu& cpu) override;
 	[[nodiscard]] bool may_run() const override;

@@ -1,3 +1,4 @@
+#Requires -Version 7.0
 param([int]$Seconds = 210, [string]$Image = 'vgk.sys')
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)

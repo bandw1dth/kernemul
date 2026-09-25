@@ -12,6 +12,7 @@
 #include "filesystem.hpp"
 #include "ethread.hpp"
 #include "thread.hpp"
+#include "thread_notify.hpp"
 #include "driver.hpp"
 #include "irp.hpp"
 #include "mdl.hpp"
@@ -52,6 +53,10 @@ struct win_kernel_state : kernel_state
 
 	// One per machine: the trampoline it returns through is a single address.
 	guest_caller calls;
+	win::thread_notify_registry thread_notify;
+	void notify_thread(vcpu& cpu, const win_thread& target, bool create);
+	void finish_thread(vcpu& cpu, NTSTATUS status);
+	[[noreturn]] void fail_thread_notify(vcpu& cpu, const char* reason);
 	win::guest_clock clock;
 	win::timer_queue timers;
 	std::recursive_mutex timer_mutex;
@@ -334,6 +339,12 @@ struct win_kernel_state : kernel_state
 		catch (const std::exception& e)
 		{
 			THREAD_LOG_ERR("syscall 0x{:X} faulted: {}", id, e.what());
+			if (cpu.checked_calls.fail()) cpu.stop();
+		}
+		catch (...)
+		{
+			THREAD_LOG_ERR("syscall 0x{:X} faulted: unknown host exception", id);
+			if (cpu.checked_calls.fail()) cpu.stop();
 		}
 
 		// A handler that moved the pc has said where to go, and stepping past would undo it.

@@ -17,13 +17,11 @@ namespace
 struct notify_routines
 {
 	std::set<addr_t> process;
-	std::set<addr_t> thread;
 	std::set<addr_t> image;
 };
 
 // What NT's fixed-size tables hold, and what a driver past the limit is told.
 constexpr std::size_t max_process_notify_routines = 64;
-constexpr std::size_t max_thread_notify_routines = 64;
 constexpr std::size_t max_image_notify_routines = 8;
 
 NTSTATUS add_notify(std::set<addr_t>& routines, const std::size_t limit,
@@ -253,7 +251,7 @@ void modules::register_ntoskrnl_process_ops(win_kernel_state& state, proc_module
 		});
 
 	state.redirect(mod, "PsTerminateSystemThread",
-		[](vcpu& cpu, const NTSTATUS exit_status) -> NTSTATUS
+		[st](vcpu& cpu, const NTSTATUS exit_status) -> NTSTATUS
 		{
 			const auto t = std::dynamic_pointer_cast<win_thread>(cpu.thread());
 
@@ -266,7 +264,7 @@ void modules::register_ntoskrnl_process_ops(win_kernel_state& state, proc_module
 			THREAD_LOG_INFO("PsTerminateSystemThread(0x{:X}): tid={} ends here",
 				exit_status, t->id());
 
-			t->finish();
+			st->finish_thread(cpu, exit_status);
 			cpu.stop();
 
 			return exit_status;
@@ -397,16 +395,23 @@ void modules::register_ntoskrnl_process_ops(win_kernel_state& state, proc_module
 		});
 
 	state.redirect(mod, "PsSetCreateThreadNotifyRoutine",
-		[notify](vcpu&, const addr_t notify_routine) -> NTSTATUS
+		[st](vcpu&, const addr_t notify_routine) -> NTSTATUS
 		{
-			return add_notify(notify->thread, max_thread_notify_routines,
-				"PsSetCreateThreadNotifyRoutine", notify_routine);
+			try
+			{
+				return st->thread_notify.add(notify_routine) ? STATUS_SUCCESS : STATUS_INVALID_PARAMETER;
+			}
+			catch (const std::bad_alloc&) { return STATUS_INSUFFICIENT_RESOURCES; }
 		});
 
 	state.redirect(mod, "PsRemoveCreateThreadNotifyRoutine",
-		[notify](vcpu&, const addr_t notify_routine) -> NTSTATUS
+		[st](vcpu& cpu, const addr_t notify_routine) -> NTSTATUS
 		{
-			return remove_notify(notify->thread, "PsRemoveCreateThreadNotifyRoutine", notify_routine);
+			const auto result = st->thread_notify.remove(notify_routine, cpu.id());
+			if (result == win::thread_notify_registry::remove_result::callback_deadlock)
+				st->fail_thread_notify(cpu, "PsRemoveCreateThreadNotifyRoutine: self-removal or callback rundown deadlock");
+			return result == win::thread_notify_registry::remove_result::removed
+				? STATUS_SUCCESS : STATUS_PROCEDURE_NOT_FOUND;
 		});
 
 	state.redirect(mod, "PsSetLoadImageNotifyRoutine",

@@ -4,6 +4,75 @@
 #include "../thread_scheduler.hpp"
 #include "../../util/log.hpp"
 
+[[noreturn]] void win_kernel_state::fail_thread_notify(vcpu& cpu, const char* reason)
+{
+	THREAD_LOG_ERR("thread notify: {}", reason);
+	if (const auto scheduler = sys_proc->scheduler()) scheduler->stop();
+	cpu.stop();
+	throw std::runtime_error(reason);
+}
+
+void win_kernel_state::notify_thread(vcpu& cpu, const win_thread& target, const bool create)
+{
+	const auto snapshot = thread_notify.snapshot();
+	if (snapshot.empty()) return;
+	const auto* pcpu = per_cpu(cpu.id());
+	if (cpu.in_dpc || (pcpu && pcpu->irql() > apc_level))
+		fail_thread_notify(cpu, "classic callback requires PASSIVE_LEVEL or APC_LEVEL");
+	const auto caller = cpu.thread();
+	const auto win_caller = std::dynamic_pointer_cast<win_thread>(caller);
+	const auto sleep_before = caller ? caller->sleep_until() : thread::time_point{};
+	const auto scheduler = sys_proc->scheduler();
+	const auto irql_before = pcpu ? pcpu->irql() : passive_level;
+	const auto kernel_apc_before = win_caller ? win_caller->kernel_apc_disable().read() : 0;
+	const auto special_apc_before = win_caller ? win_caller->special_apc_disable().read() : 0;
+	const auto cid = target.client_id().read();
+	const std::uint64_t args[] = { guest_va(cid.UniqueProcess), guest_va(cid.UniqueThread), create ? 1u : 0u };
+	for (const auto& registration : snapshot)
+	{
+		if (!thread_notify.acquire(registration, cpu.id())) continue;
+		try
+		{
+			calls.call(cpu, registration->routine, args, 0, [&]
+			{
+				if (win_caller && win_caller->suspend_count())
+					fail_thread_notify(cpu, "suspended lifecycle callbacks are unsupported");
+				if ((win_caller && win_caller->is_waiting())
+					|| (caller && caller->sleep_until() != sleep_before))
+					fail_thread_notify(cpu, "blocking guest callbacks are unsupported");
+				return cpu.dpc_failed || cpu.execution_failed() || (scheduler && scheduler->stopped())
+					|| (caller && caller->is_finished());
+			});
+			if ((pcpu && pcpu->irql() != irql_before)
+				|| (win_caller && (win_caller->kernel_apc_disable().read() != kernel_apc_before
+					|| win_caller->special_apc_disable().read() != special_apc_before)))
+				fail_thread_notify(cpu, "callback returned with an unbalanced IRQL/APC context");
+		}
+		catch (...)
+		{
+			thread_notify.release(registration, cpu.id());
+			if (scheduler) scheduler->stop();
+			cpu.stop();
+			throw;
+		}
+		thread_notify.release(registration, cpu.id());
+	}
+}
+
+void win_kernel_state::finish_thread(vcpu& cpu, const NTSTATUS status)
+{
+	const auto t = std::dynamic_pointer_cast<win_thread>(cpu.thread());
+	if (!t) return;
+	if (thread_notify.in_callback(cpu.id()))
+		fail_thread_notify(cpu, "a thread cannot terminate inside a lifecycle callback");
+	if (t->is_finished() || t->exit_notification_started) return;
+	t->set_exit_status(status);
+	t->exit_notification_started = true;
+	try { notify_thread(cpu, *t, false); }
+	catch (...) { fail_thread_notify(cpu, "exit callback failed before thread completion"); }
+	t->finish();
+}
+
 win_kernel_proc::win_kernel_proc(id_type id, win_kernel_state& kernel, std::shared_ptr<struct addr_space> space)
 	:	windows_process(id, std::move(space), kernel.objs, kernel.fs), kernel_(kernel) {}
 
@@ -28,6 +97,7 @@ std::shared_ptr<thread> windows_process::create_suspended_thread(vcpu& cpu,
 	const auto size = thread_stack_size(stack_size);
 
 	const addr_t stack_base = addr_space_->alloc(size, prot_rw | prot_supervisor);
+	if (!stack_base) return {};
 	auto self = std::static_pointer_cast<windows_process>(shared_from_this());
 	auto t = std::make_shared<win_kernel_thread>(
 		id, std::move(self), start_addr, stack_base, size, cpu);
@@ -35,13 +105,21 @@ std::shared_ptr<thread> windows_process::create_suspended_thread(vcpu& cpu,
 	t->set_emulator(emulator_);
 	setup_ethread(t, start_addr);
 
+	try
 	{
-		std::unique_lock lock(thread_mtx_);
-		threads_[t->id()] = t;
+		{
+			std::unique_lock lock(thread_mtx_);
+			threads_[t->id()] = t;
+		}
+		// On the queue, but no cpu takes it until it is started.
+		scheduler_->enqueue(cpu, t, args);
 	}
-
-	// On the queue, but no cpu takes it until it is started.
-	scheduler_->enqueue(cpu, t, args);
+	catch (...)
+	{
+		destroy_ethread(*t);
+		process::terminate_thread(t->id());
+		throw;
+	}
 	return t;
 }
 
@@ -95,6 +173,7 @@ void windows_process::setup_ethread(const std::shared_ptr<win_thread>& t, const 
 			prot_rw | prot_supervisor));
 
 	t->set_ethread(obj);
+	if (!obj) return;
 
 	if (!eprocess_)
 		return;

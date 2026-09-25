@@ -4,6 +4,7 @@
 #include "arch.hpp"
 #include "defs.hpp"
 #include "mmu.hpp"
+#include "guest_call_completion.hpp"
 #include <functional>
 #include <memory>
 #include <span>
@@ -31,6 +32,7 @@ public:
 	// Owned by this vCPU's host thread, for checked deferred guest callbacks only.
 	bool in_dpc = false;
 	bool dpc_failed = false;
+	checked_guest_calls checked_calls;
 	virtual void flush_tlb() = 0;
 
 	virtual void reg_read(reg_t reg, void* value, std::size_t size) = 0;

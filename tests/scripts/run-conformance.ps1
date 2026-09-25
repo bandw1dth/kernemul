@@ -1,3 +1,4 @@
+#Requires -Version 7.0
 param(
     [string]$Executable = 'build-x64-whp\Release\kernemul.exe',
     [string]$Driver = 'timer_conformance',

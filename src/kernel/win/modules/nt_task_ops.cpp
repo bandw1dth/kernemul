@@ -331,17 +331,23 @@ void modules::register_ntoskrnl_task_ops(win_kernel_state& state, proc_module& m
 
 		THREAD_LOG_INFO("NtTerminateThread(tid={}, status=0x{:X})", t->id(), exit_status);
 
-		t->set_exit_status(exit_status);
-
 		if (t == self)
 		{
-			t->finish();
+			st->finish_thread(cpu, exit_status);
 			cpu.stop();
 			return STATUS_SUCCESS;
 		}
 
 		// The thread's own process: a user thread is not on the system process's lists.
-		t->proc()->terminate_thread(t->id());
+		if (!st->thread_notify.without_live_notifications([&]
+		{
+			t->set_exit_status(exit_status);
+			t->proc()->terminate_thread(t->id());
+		}))
+		{
+			THREAD_LOG_ERR("NtTerminateThread: remote termination with live thread notifications is unsupported");
+			return STATUS_NOT_SUPPORTED;
+		}
 
 		return STATUS_SUCCESS;
 	};
@@ -719,6 +725,9 @@ void modules::register_ntoskrnl_task_ops(win_kernel_state& state, proc_module& m
 			return STATUS_INVALID_HANDLE;
 		}
 
+		if (t == cpu.thread() && st->thread_notify.in_callback(cpu.id()))
+			st->fail_thread_notify(cpu, "NtSuspendThread: self-suspension inside a lifecycle callback is unsupported");
+
 		const auto previous = t->suspend();
 
 		if (previous_count)
@@ -859,14 +868,18 @@ void modules::register_ntoskrnl_task_ops(win_kernel_state& state, proc_module& m
 		THREAD_LOG_INFO("NtTerminateProcess(status=0x{:X}): ending {} other thread(s)",
 			exit_status, ids.size());
 
-		// Every thread of the process ends with the status the process was given.
-		target.for_each_thread([exit_status](win_thread& t) { t.set_exit_status(exit_status); });
-
-		for (const auto id : ids)
-			target.terminate_thread(id);
+		if (!ids.empty() && !st->thread_notify.without_live_notifications([&]
+		{
+			target.for_each_thread([exit_status](win_thread& t) { t.set_exit_status(exit_status); });
+			for (const auto id : ids) target.terminate_thread(id);
+		}))
+		{
+			THREAD_LOG_ERR("NtTerminateProcess: remote thread termination with live thread notifications is unsupported");
+			return STATUS_NOT_SUPPORTED;
+		}
 
 		if (self)
-			self->finish();
+			st->finish_thread(cpu, exit_status);
 
 		cpu.stop();
 

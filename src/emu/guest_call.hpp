@@ -27,6 +27,7 @@ public:
 	std::uint64_t call(vcpu& cpu, addr_t routine, std::span<const std::uint64_t> args,
 		std::size_t scratch = 0, const std::function<bool()>& cancelled = {})
 	{
+		checked_guest_calls::scope checked(cpu.checked_calls, static_cast<bool>(cancelled));
 		const auto a = cpu.arch();
 		const auto regs = a->regs();
 		const auto& conv = *cpu.emu()->call_conv();
@@ -53,14 +54,18 @@ public:
 		{
 			do
 			{
-				cpu.run();
-				if (cancelled && (cancelled() || cpu.execution_failed()))
+				if (checked.failed() || (cancelled && cancelled()))
 					throw std::runtime_error("guest callback stopped before returning");
-				if (!cancelled || invocation.returned()) break;
+				cpu.run();
+				if (checked.failed() || (cancelled && cancelled())
+					|| (checked.checked() && cpu.execution_failed()))
+					throw std::runtime_error("guest callback stopped before returning");
+				if (!checked.checked() || invocation.returned()) break;
 			} while (true);
 		}
 		catch (...)
 		{
+			cpu.checked_calls.fail();
 			for (std::size_t i = 0; i < regs.size(); ++i)
 				cpu.reg_write(regs[i], &saved[i], a->reg_size(regs[i]));
 			throw;

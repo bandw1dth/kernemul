@@ -12,7 +12,7 @@ void modules::register_ntoskrnl_thread_ops(win_kernel_state& state, proc_module&
 	auto* sys_proc = state.sys_proc.get();
 
 	// Nothing of this stub is executed; threads are given it as their return address.
-	state.redirect(mod, kernel_thread_startup, [](vcpu& cpu)
+	state.redirect(mod, kernel_thread_startup, [st](vcpu& cpu)
 	{
 		const auto t = cpu.thread();
 
@@ -24,20 +24,17 @@ void modules::register_ntoskrnl_thread_ops(win_kernel_state& state, proc_module&
 			const auto status = static_cast<NTSTATUS>(
 				cpu.emu()->call_conv()->read_ret(cpu));
 
-			if (const auto wt = std::dynamic_pointer_cast<win_thread>(t))
-				wt->set_exit_status(status);
-
 			THREAD_LOG_INFO("thread {} returned, status=0x{:X}", t->id(),
 				static_cast<std::uint32_t>(status));
 
-			t->finish();
+			st->finish_thread(cpu, status);
 		}
 
 		cpu.stop();
 	});
 
 	state.redirect(mod, "PsCreateSystemThread",
-		[sys_proc](vcpu& cpu, emu_object<std::uint64_t> thread_handle_out,
+		[st, sys_proc](vcpu& cpu, emu_object<std::uint64_t> thread_handle_out,
 			[[maybe_unused]] std::uint32_t desired_access,
 			[[maybe_unused]] emu_object<void> object_attributes, [[maybe_unused]] std::uint64_t process_handle,
 			emu_object<CLIENT_ID> client_id_out, addr_t start_routine, addr_t start_context) -> NTSTATUS
@@ -45,31 +42,55 @@ void modules::register_ntoskrnl_thread_ops(win_kernel_state& state, proc_module&
 			THREAD_LOG_INFO("PsCreateSystemThread(handle_out=0x{:X}, start=0x{:X}, ctx=0x{:X})",
 				thread_handle_out.address(), start_routine, start_context);
 
-			// The context goes in before the thread starts: a started thread is another cpu's.
-			auto t = sys_proc->create_suspended_thread(cpu, start_routine);
-			cpu.emu()->call_conv()->set_arg(cpu, *t, 0, start_context);
-			t->start();
-
-			const auto ethread = std::static_pointer_cast<win_thread>(t)->ethread().address();
-
-			if (!ethread)
+			if (!thread_handle_out || !start_routine) return STATUS_INVALID_PARAMETER;
+			// Validate both complete output ranges before allocating a child. Guest writes
+			// can still fault later; rollback below keeps that child off the runnable queue.
+			try
 			{
-				THREAD_LOG_ERR("PsCreateSystemThread: tid={} has no ETHREAD", t->id());
-				return STATUS_NO_MEMORY;
+				static_cast<void>(thread_handle_out.read());
+				if (client_id_out) static_cast<void>(client_id_out.read());
 			}
+			catch (...) { return STATUS_ACCESS_VIOLATION; }
 
-			const auto handle = sys_proc->handle_table().create_handle(ethread, THREAD_ALL_ACCESS);
-
-			if (thread_handle_out)
+			std::shared_ptr<win_thread> t;
+			std::uint64_t handle = 0;
+			auto rollback = [&]
+			{
+				if (handle) sys_proc->handle_table().close_handle(handle);
+				if (t) sys_proc->terminate_thread(t->id());
+			};
+			try
+			{
+				t = std::static_pointer_cast<win_thread>(sys_proc->create_suspended_thread(cpu, start_routine));
+				if (!t || !t->ethread())
+				{
+					rollback();
+					return STATUS_NO_MEMORY;
+				}
+				cpu.emu()->call_conv()->set_arg(cpu, *t, 0, start_context);
+				handle = sys_proc->handle_table().create_handle(t->ethread().address(), THREAD_ALL_ACCESS);
+				if (!handle)
+				{
+					rollback();
+					return STATUS_NO_MEMORY;
+				}
+				if (client_id_out) client_id_out.write(t->client_id().read());
 				thread_handle_out.write(handle);
-
-			if (client_id_out)
-			{
-				CLIENT_ID cid{};
-				cid.UniqueProcess = reinterpret_cast<PVOID>(static_cast<std::uintptr_t>(sys_proc->id()));
-				cid.UniqueThread = reinterpret_cast<PVOID>(static_cast<std::uintptr_t>(t->id()));
-				client_id_out.write(cid);
 			}
+			catch (const std::bad_alloc&) { rollback(); return STATUS_INSUFFICIENT_RESOURCES; }
+			catch (...) { rollback(); return STATUS_ACCESS_VIOLATION; }
+
+			try
+			{
+				st->notify_thread(cpu, *t, true);
+			}
+			catch (...)
+			{
+				rollback();
+				st->fail_thread_notify(cpu, "create callback failed before child publication");
+			}
+			t->notification_origin = win_thread::notify_origin::live_guest;
+			t->start();
 
 			THREAD_LOG_INFO("PsCreateSystemThread: created tid={}, handle=0x{:X}", t->id(), handle);
 			return STATUS_SUCCESS;

@@ -238,6 +238,13 @@ struct kernel_state
 						THREAD_LOG_ERR("{}!{} faulted: {}", m->name,
 							name_at(*m, addr), e.what());
 						if (cpu.in_dpc) { cpu.dpc_failed = true; cpu.stop(); }
+						if (cpu.checked_calls.fail()) cpu.stop();
+					}
+					catch (...)
+					{
+						THREAD_LOG_ERR("{}!{} faulted: unknown host exception", m->name, name_at(*m, addr));
+						if (cpu.in_dpc) { cpu.dpc_failed = true; cpu.stop(); }
+						if (cpu.checked_calls.fail()) cpu.stop();
 					}
 
 					// Stopping the cpu moves the pc on some architectures, so it is put back.
@@ -248,11 +255,17 @@ struct kernel_state
 				}
 
 				THREAD_LOG_ERR("unimplemented function {}!{}", m->name, name_at(*m, addr));
+				const bool checked_failed = cpu.checked_calls.fail();
 				if (cpu.in_dpc)
 				{
 					// The checked caller will stop the scheduler after restoring context.
 					// This must also work on an idle CPU with no associated thread.
 					cpu.dpc_failed = true;
+					cpu.stop();
+					return;
+				}
+				if (checked_failed)
+				{
 					cpu.stop();
 					return;
 				}

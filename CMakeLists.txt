@@ -303,6 +303,7 @@ set(kernemul_SOURCES
 	"src/kernel/win/syscalls.hpp"
 	"src/kernel/win/thread.cpp"
 	"src/kernel/win/thread.hpp"
+	"src/kernel/win/thread_notify.hpp"
 	"src/kernel/win/time_service.cpp"
 	"src/kernel/win/timer_queue.hpp"
 	"src/kernel/win/types.hpp"

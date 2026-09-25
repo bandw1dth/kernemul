@@ -1,7 +1,8 @@
+#Requires -Version 7.0
 param(
     [string]$Executable = 'build-x64-whp\Release\kernemul.exe',
-    [ValidateSet('callback_failure_delay', 'callback_failure_wait', 'core_failure_unsupported_dpc', 'core_failure_nested_dpc')]
-    [string[]]$Driver = @('callback_failure_delay', 'callback_failure_wait', 'core_failure_unsupported_dpc', 'core_failure_nested_dpc'),
+    [ValidateSet('callback_failure_delay', 'callback_failure_wait', 'core_failure_unsupported_dpc', 'core_failure_nested_dpc', 'thread_notify_failure_delay', 'thread_notify_failure_remove', 'thread_notify_failure_api', 'thread_notify_failure_suspend')]
+    [string[]]$Driver = @('callback_failure_delay', 'callback_failure_wait', 'core_failure_unsupported_dpc', 'core_failure_nested_dpc', 'thread_notify_failure_delay', 'thread_notify_failure_remove', 'thread_notify_failure_api', 'thread_notify_failure_suspend'),
     [ValidateRange(1, 30)][int]$TimeoutSeconds = 25
 )
 $ErrorActionPreference = 'Stop'
@@ -24,7 +25,20 @@ foreach ($name in $Driver) {
     $log = [string](Get-Content -LiteralPath $out -Raw)
     $errorLog = [string](Get-Content -LiteralPath $err -Raw)
     $required = [ordered]@{}
-    if ($name -eq 'core_failure_unsupported_dpc') {
+    if ($name -like 'thread_notify_failure_*') {
+        $kind = $name.Substring('thread_notify_failure_'.Length).ToUpperInvariant()
+        $tag = "THREAD_NOTIFY_$kind"
+        $required.preCreate = "DbgPrint: $tag PRE_CREATE"
+        switch ($kind) {
+            'DELAY' { $marker='PRE_WAIT'; $diagnostic='thread notify: blocking guest callbacks are unsupported' }
+            'REMOVE' { $marker='PRE_REMOVE'; $diagnostic='thread notify: PsRemoveCreateThreadNotifyRoutine: self-removal or callback rundown deadlock' }
+            'API' { $marker='PRE_FAULT'; $diagnostic='ntoskrnl\.exe!KeSetTimerEx faulted: negative KeSetTimerEx period' }
+            'SUSPEND' { $marker='PRE_SUSPEND'; $diagnostic='thread notify: NtSuspendThread: self-suspension inside a lifecycle callback is unsupported' }
+        }
+        $required.callbackBegin = "DbgPrint: $tag $marker"
+        $required.diagnostic = $diagnostic
+        $forbiddenPattern = 'FORBIDDEN_|SETUP_FAILED|CONFORMANCE FAIL'
+    } elseif ($name -eq 'core_failure_unsupported_dpc') {
         $required.armed = 'DbgPrint: CONFORMANCE ARMED threadless-unsupported-dpc'
         $required.threadlessBegin = 'tid=0 pid=0 kernel\] DPC begin:'
         $required.callbackBegin = 'DbgPrint: CONFORMANCE BEGIN threadless-unsupported-dpc'
