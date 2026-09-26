@@ -99,3 +99,51 @@ in-tree ABI layout assertions but was not separately built or executed here.
 Independent review found no material issue in the encoder, integration or
 fixtures. Matching real-Windows byte-for-byte output is not claimed; the tested
 contract is coherent, bounded resource reporting for this emulator profile.
+
+## Bounded VGK capture
+
+Implementation commit: `a88407c`. The frozen WHP run is
+`build-conformance/kernel-20260926-234423-577`, with local-only lab commit
+`072c0a20cb03592414be6f3cac170dc79a098ce7` and executable SHA-256
+`FA43E594C760D94982A1FC554947951D403AE7F4E842224ECB7F2A730FEE0BFF`.
+The author-provided in-memory compatibility patch remains local. The generic
+branch and its validated executable were restored once the run was frozen.
+The only native companion is the process-notification fixture, not the service.
+
+Compared with `kernel-20260926-232326-759`, the missing-key warning is replaced
+by an actual key open and two value queries:
+
+| Time | Observation |
+| --- | --- |
+| 23:44:32.867 | Physical Memory key opens successfully, handle `0x38` |
+| 23:44:32.869 | Value query reports 102 bytes required |
+| 23:44:32.870 | VGK allocates a 102-byte result buffer |
+| 23:44:32.871 | Value query writes 102 bytes |
+| 23:44:32.872 | VGK frees the buffer and closes the key |
+| 23:44:33.635 | Driver initialization returns `STATUS_SUCCESS` |
+
+The size matches `KEY_VALUE_FULL_INFORMATION` with its 20-byte fixed header,
+22-byte `.Translated` name, and 60-byte resource-list payload. The trace does
+not expose every subsequent instruction interpreting that payload. The existing
+`B000001A` diagnostic still follows this sequence, and `E00000EF` involving
+`fltmgr.sys` also remains; both occurred in the preceding storage capture.
+Successful resource delivery is not evidence that those diagnostics are solved.
+
+The run completed **210.035 seconds** and was deliberately stopped at its limit
+(host exit code `-1`). The three-minute timer first read signaled at
+23:47:26.538, with 19 signaled reads before the deadline. There were 145 handled
+exceptions, zero unhandled exceptions, zero API/callback faults and no executed
+unimplemented functions. Stderr was empty; the only startup errors were the
+three known optional IRQL hook names.
+
+The preceding storage behavior is preserved: one rejected malformed ATA request,
+successful 8-byte and 94-byte storage-property responses, and eight absent-disk
+open failures. Firmware reports three successful reads and nine absent variables.
+CI reports two trusted SHA-256 checks and six digest/algorithm mismatches.
+Four process callbacks and four balanced attach/detach pairs were observed.
+
+The target file remains unchanged at SHA-256
+`3CB2F36CF9F3B66BF63561D24649422D852229F2C788A7AAA783752DCE4AB39F`.
+The manifest, stdout/stderr and `physical-memory-summary.json` preserve the local
+capture evidence. Generated executables and traces are not committed; the lab
+patch is not part of the generic branch.
