@@ -160,6 +160,36 @@ bool win_filesystem::dir_exists(const std::string_view path) const
 	return false;
 }
 
+win_filesystem::file_enumeration win_filesystem::enumerate_files_under(
+	const std::string_view directory, const std::string_view suffix,
+	const std::size_t max_examined, const std::size_t max_results) const
+{
+	auto prefix = normalize(directory);
+	if (!prefix.empty()) prefix += '/';
+	const auto normalized_suffix = normalize(suffix);
+	file_enumeration result;
+	for (auto it = files_.begin(); it != files_.end(); ++it)
+	{
+		if (result.examined == max_examined)
+		{
+			result.limit_exceeded = true;
+			break;
+		}
+		++result.examined;
+		const auto& path = it->first;
+		// The trailing separator excludes a sibling such as catrootEvil.
+		if (path.size() <= prefix.size() || !path.starts_with(prefix)
+			|| !path.ends_with(normalized_suffix)) continue;
+		if (result.paths.size() == max_results)
+		{
+			result.limit_exceeded = true;
+			break;
+		}
+		result.paths.push_back(path);
+	}
+	return result;
+}
+
 std::vector<win_filesystem::dir_entry> win_filesystem::list_dir(const std::string_view path) const
 {
 	auto prefix = normalize(path);

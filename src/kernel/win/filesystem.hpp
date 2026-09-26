@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -50,6 +51,19 @@ public:
 	bool link(std::string_view from, std::string_view to);
 
 	[[nodiscard]] std::vector<dir_entry> list_dir(std::string_view path) const;
+
+	struct file_enumeration
+	{
+		std::vector<std::string> paths;
+		std::size_t examined = 0;
+		bool limit_exceeded = false;
+	};
+	// One bounded pass over files_, including nonmatches in examined. Does not visit
+	// empty directories. Paths and suffix matching are normalized, paths are unsorted.
+	// Limits are checked before inspecting another entry or copying another match.
+	// A limit_exceeded result is incomplete; callers must not treat it as exhaustive.
+	[[nodiscard]] file_enumeration enumerate_files_under(std::string_view directory,
+		std::string_view suffix, std::size_t max_examined, std::size_t max_results) const;
 
 	bool load_file(const std::filesystem::path& host_path, std::string_view virtual_path);
 	bool load_dir(const std::filesystem::path& host_dir, std::string_view virtual_path);

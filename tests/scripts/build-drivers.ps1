@@ -24,7 +24,7 @@ foreach ($source in $sources) {
     if ($source.BaseName -like 'process_notify_*' -and $source.BaseName -ne 'process_notify_integrity') {
         $extraLinkFlags += '/integritycheck'
     }
-    if ($source.BaseName -eq 'ci_conformance') {
+    if ($source.BaseName -like 'ci_*') {
         $ciLibrary = Join-Path $out 'ci_fixture.lib'
         & "$vc\bin\Hostx64\x64\lib.exe" /nologo /machine:x64 "/def:$root\tests\drivers\ci_exports.def" "/out:$ciLibrary"
         if ($LASTEXITCODE) { throw 'CI fixture import library failed.' }

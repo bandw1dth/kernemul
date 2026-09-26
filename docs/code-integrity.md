@@ -1,4 +1,8 @@
-# Code Integrity boundary
+# Code Integrity boundary: earlier ABI repair
+
+This page records the earlier failure-only adapter and its ABI corrections.
+The current cryptographic backend, policy, and validation are described in
+[CI verification](ci-verification.md).
 
 The modern 64-bit CI adapters use explicit guest layouts and initialize failure
 outputs consistently. They do not implement Authenticode signature verification,

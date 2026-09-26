@@ -1,6 +1,6 @@
 #include <ntifs.h>
 
-/* Guest-only modern x64 CI ABI checks; no cryptographic success is expected. */
+/* Guest-only modern x64 CI ABI checks with malformed and unsigned inputs. */
 typedef struct {
     ULONG size;
     NTSTATUS status;
@@ -138,7 +138,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING path)
             status = CiValidateFileObject(file_object, 0, 0, &signer.policy, &timestamp.policy,
                 &time, digest, &digest_size, &digest_algorithm);
             check(status == STATUS_INVALID_IMAGE_HASH && policy_is(&signer, status) &&
-                policy_is(&timestamp, status), "valid-file-unavailable-verifier-status");
+                policy_is(&timestamp, status), "unsigned-file-untrusted-status");
             check(time.QuadPart == 0 && digest_size == 0 && digest_algorithm == 0 &&
                 bytes_are(digest, sizeof(digest), 0x5a), "valid-file-no-raw-hash-substitution");
             ObDereferenceObject(file_object);

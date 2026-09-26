@@ -141,7 +141,7 @@ sources = ["src/**.cpp", "src/**.hpp"]
 include-directories = ["src", "vendor/pe/src", "vendor/ia32-doc/out"]
 compile-features = ["cxx_std_23"]
 link-libraries = ["spdlog::spdlog", "unicorn", "raw_pdb", "Boost::beast", "OpenSSL::SSL", "OpenSSL::Crypto"]
-windows.link-libraries = ["ws2_32"]
+windows.link-libraries = ["ws2_32", "crypt32", "wintrust", "bcrypt", "advapi32"]
 windows.compile-definitions = ["NOMINMAX"]
 # The generated Windows types put every struct under #pragma pack(1) and lean on
 # ms_struct for the rest of the layout, so a bitfield keeps a whole allocation

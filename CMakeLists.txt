@@ -204,6 +204,8 @@ set(kernemul_SOURCES
 	"src/kernel/win/boot_seed.cpp"
 	"src/kernel/win/boot_seed.hpp"
 	"src/kernel/win/callback_registry.hpp"
+	"src/kernel/win/code_integrity.cpp"
+	"src/kernel/win/code_integrity.hpp"
 	"src/kernel/win/defs.hpp"
 	"src/kernel/win/dispatcher.hpp"
 	"src/kernel/win/driver.hpp"
@@ -211,6 +213,7 @@ set(kernemul_SOURCES
 	"src/kernel/win/ethread.hpp"
 	"src/kernel/win/exception.cpp"
 	"src/kernel/win/exception.hpp"
+	"src/kernel/win/execution_mode.hpp"
 	"src/kernel/win/filesystem.cpp"
 	"src/kernel/win/filesystem.hpp"
 	"src/kernel/win/guest_clock.hpp"
@@ -293,6 +296,8 @@ set(kernemul_SOURCES
 	"src/kernel/win/pool.hpp"
 	"src/kernel/win/process.cpp"
 	"src/kernel/win/process.hpp"
+	"src/kernel/win/process_memory.hpp"
+	"src/kernel/win/process_notify.hpp"
 	"src/kernel/win/process_params.hpp"
 	"src/kernel/win/registry.cpp"
 	"src/kernel/win/registry.hpp"
@@ -434,6 +439,10 @@ target_link_libraries(kernemul PRIVATE
 if(WIN32) # windows
 	target_link_libraries(kernemul PRIVATE
 		ws2_32
+		crypt32
+		wintrust
+		bcrypt
+		advapi32
 	)
 endif()
 
