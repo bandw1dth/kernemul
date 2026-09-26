@@ -163,6 +163,23 @@ void modules::register_ntoskrnl_object_ops(win_kernel_state& state, proc_module&
 		if (const auto host = sys_proc->handle_table().get_object<file_host>(handle);
 			host && host->is_device())
 		{
+			if (host->builtin)
+			{
+				std::scoped_lock lock(host->close_mutex);
+				const auto entry = sys_proc->handle_table().lookup_handle(handle);
+				if (!entry || !sys_proc->handle_table().close_handle(handle)) return STATUS_INVALID_HANDLE;
+				const auto header = st->kernel_space().read_mem<_OBJECT_HEADER>(entry->body_addr - sizeof(_OBJECT_HEADER));
+				if (header.HandleCount == 0 && host->file_object)
+				{
+					if (auto* emulator = st->emulator())
+						for (const auto major : {irp_mj_cleanup, irp_mj_close})
+							emulator->dispatch_irp(cpu, {.major = major, .device_object = host->device_object,
+								.file_object = host->file_object});
+					st->pool.free(host->file_object);
+					host->file_object = 0;
+				}
+				return STATUS_SUCCESS;
+			}
 			if (auto* const emulator = st->emulator())
 			{
 				for (const auto major : { irp_mj_cleanup, irp_mj_close })

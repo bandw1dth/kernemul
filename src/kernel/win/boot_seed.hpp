@@ -9,4 +9,5 @@ namespace win
 	// path it stats is absent.
 	void seed_registry(win_kernel_state& state);
 	void seed_filesystem(win_kernel_state& state);
+	void seed_storage_device(win_kernel_state& state);
 }

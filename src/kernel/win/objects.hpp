@@ -2,6 +2,7 @@
 #include "dispatcher.hpp"
 #include "filesystem.hpp"
 #include "win_obj_manager.hpp"
+#include "builtin_device.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -23,6 +24,8 @@ struct file_host final : win_object
 	// device object, and the file object is the per-open context it is handed on every request.
 	addr_t device_object = 0;
 	addr_t file_object = 0;
+	bool builtin = false;
+	std::mutex close_mutex;
 
 	[[nodiscard]] bool is_device() const noexcept { return device_object != 0; }
 };
@@ -32,6 +35,7 @@ struct file_host final : win_object
 struct device_host final : win_object
 {
 	addr_t driver_object = 0;
+	std::shared_ptr<builtin_device> builtin;
 
 	// As IoCreateDevice was given it, for logging and for unregistering the name on delete.
 	std::string name;

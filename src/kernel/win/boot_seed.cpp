@@ -1,4 +1,5 @@
 #include "boot_seed.hpp"
+#include "storage_device.hpp"
 #include "win_kernel.hpp"
 #include "process_params.hpp"
 #include "../../util/log.hpp"
@@ -98,12 +99,30 @@ void win::seed_filesystem(win_kernel_state& state)
 		fs.create_directory(dir);
 	}
 
-	// A raw disk is a device rather than a file on a real system, but nothing here registers
-	// one, so the open lands on a file and the io layer answers the storage controls itself.
-	// A driver that walks the drives opens them until one fails, so the ones past the first
-	// are here to be found rather than to be described.
-	for (int i = 0; i <= 5; ++i)
-		static_cast<void>(fs.create("physicaldrive" + std::to_string(i)));
+	LOG_INFO("filesystem: seeded boot directories");
+}
 
-	LOG_INFO("filesystem: seeded boot directories and devices");
+void win::seed_storage_device(win_kernel_state& state)
+{
+    auto& space = state.kernel_space();
+    auto driver = make_default_driver_object({});
+    const auto driver_address = state.objs.create_object(0, &driver, sizeof(driver),
+        std::make_shared<win_object>(), prot_rw | prot_supervisor);
+    _DEVICE_OBJECT device{};
+    device.Type = io_type_device;
+    device.Size = sizeof(device);
+    device.DriverObject = reinterpret_cast<_DRIVER_OBJECT*>(driver_address);
+    device.DeviceType = 7; // FILE_DEVICE_DISK
+    device.StackSize = 1;
+    device.SectorSize = 512;
+    auto host = std::make_shared<device_host>();
+    host->driver_object = driver_address;
+    host->name = "\\Device\\Harddisk0\\DR0";
+    host->builtin = make_storage_device();
+    const auto address = state.objs.create_object(0, &device, sizeof(device), host,
+        prot_rw | prot_supervisor);
+    space.write_mem<addr_t>(driver_address + offsetof(_DRIVER_OBJECT, DeviceObject), address);
+    state.register_device(host->name, address);
+    state.register_device_link("\\DosDevices\\PhysicalDrive0", host->name);
+    state.register_device_link("\\GLOBAL??\\PhysicalDrive0", host->name);
 }

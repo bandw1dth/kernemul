@@ -208,6 +208,7 @@ struct win_kernel_state : kernel_state
 
 		win::seed_registry(*this);
 		win::seed_filesystem(*this);
+		win::seed_storage_device(*this);
 
 		space.mmu_->map_virt(space, kuser_shared_data_kernel_va,
 			sizeof(_KUSER_SHARED_DATA), prot_rw | prot_supervisor);
@@ -785,7 +786,8 @@ public:
 	// reads the result back out of it. It runs on the calling thread's own cpu: driver code and
 	// device objects live in the kernel half, which every address space aliases, so there is
 	// nothing to switch to reach them.
-	irp_result dispatch_irp(vcpu& cpu, const irp_request& req)
+	irp_result dispatch_irp(vcpu& cpu, const irp_request& req,
+		const builtin_io_context& context = {})
 	{
 		auto& space = *cpu.curr_addr_space();
 
@@ -796,6 +798,9 @@ public:
 			LOG_ERR("irp: 0x{:X} is not a device object", req.device_object);
 			return { STATUS_INVALID_PARAMETER, 0 };
 		}
+
+		if (device->builtin)
+			return device->builtin->dispatch(kernel_, cpu, req, context);
 
 		const auto routine = space.read_mem<addr_t>(device->driver_object
 			+ offsetof(_DRIVER_OBJECT, MajorFunction) + req.major * sizeof(addr_t));

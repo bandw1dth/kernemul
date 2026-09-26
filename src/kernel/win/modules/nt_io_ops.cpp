@@ -3,6 +3,9 @@
 #include "../filesystem.hpp"
 #include "../mdl.hpp"
 #include "../objects.hpp"
+#include "../storage_device.hpp"
+#include "../execution_mode.hpp"
+#include "../process_memory.hpp"
 #include "../pool.hpp"
 #include "../status.hpp"
 #include "../string.hpp"
@@ -160,55 +163,94 @@ struct open_result
 // and may refuse, and the file object built for it is the per-open context every later request on
 // the handle carries.
 open_result open_device(vcpu& cpu, win_kernel_state& state, const addr_t device,
-	const std::string& path, emu_object<std::uint64_t> file_handle)
+	const std::string& path, emu_object<std::uint64_t> file_handle,
+	std::uint32_t access, std::uint32_t disposition, std::uint32_t options)
 {
-	auto* const emulator = state.emulator();
-	const auto file_object = emulator
-		? state.pool.allocate(sizeof(_FILE_OBJECT), pool_tag("File"), true)
-		: 0;
-
-	if (!file_object)
-		return { STATUS_INSUFFICIENT_RESOURCES, 0 };
-
-	_FILE_OBJECT body{};
-	body.Type = io_type_file;
-	body.Size = static_cast<short>(sizeof(_FILE_OBJECT));
-	body.DeviceObject = reinterpret_cast<_DEVICE_OBJECT*>(static_cast<std::uintptr_t>(device));
-
-	emu_object<_FILE_OBJECT>(*cpu.curr_addr_space(), file_object).write(body);
-
-	const auto result = emulator->dispatch_irp(cpu, {
-		.major = irp_mj_create,
-		.device_object = device,
-		.file_object = file_object,
-	});
-
-	auto host = std::make_shared<file_host>();
-	host->path = path;
-	host->device_object = device;
-	host->file_object = file_object;
-
-	const std::uint8_t placeholder[sizeof(addr_t)] = {};
-	const auto addr = result.status >= 0
-		? state.objs.create_object(0, placeholder, sizeof(placeholder), std::move(host),
-			prot_rw | prot_supervisor)
-		: 0;
-
-	if (!addr)
+	const auto device_host_object = state.objs.get_object<device_host>(device);
+	const bool builtin = device_host_object && device_host_object->builtin;
+	if (builtin)
 	{
-		state.pool.free(file_object);
-		THREAD_LOG_WARN("open_device('{}') refused, status=0x{:X}", path,
-			static_cast<std::uint32_t>(result.status));
-		return { result.status < 0 ? result.status : STATUS_INSUFFICIENT_RESOURCES, 0 };
+		if (!file_handle) return {STATUS_INVALID_PARAMETER, 0};
+		if (options & file_directory_file) return {STATUS_NOT_A_DIRECTORY, 0};
+		if (disposition != file_open && disposition != file_open_if)
+			return {STATUS_INVALID_PARAMETER, 0};
+		// Normalize generic file rights before storing the granted mask on the handle.
+		if (access & 0x80000000u) access |= 0x120089;
+		if (access & 0x40000000u) access |= 0x120116;
+		if (access & 0x20000000u) access |= 0x1200a0;
+		if (access & 0x10000000u) access |= 0x1f01ff;
+		access &= 0x0fffffffu;
 	}
+	try
+	{
+		auto* const emulator = state.emulator();
+		const auto file_object = emulator
+			? state.pool.allocate(sizeof(_FILE_OBJECT), pool_tag("File"), true)
+			: 0;
 
-	if (file_handle)
-		file_handle.write(state.sys_proc->handle_table().create_handle(addr, 0));
+		if (!file_object)
+			return { STATUS_INSUFFICIENT_RESOURCES, 0 };
 
-	THREAD_LOG_INFO("open_device('{}') -> device=0x{:X}, file object at 0x{:X}",
-		path, device, file_object);
+		// This guard belongs to the call, never to file_host (pool dies before objs).
+		auto release_failed_open = [&](void*) { if (builtin) state.pool.free(file_object); };
+		std::unique_ptr<void, decltype(release_failed_open)> pool_guard(
+			reinterpret_cast<void*>(file_object), release_failed_open);
+		_FILE_OBJECT body{};
+		body.Type = io_type_file;
+		body.Size = static_cast<short>(sizeof(_FILE_OBJECT));
+		body.DeviceObject = reinterpret_cast<_DEVICE_OBJECT*>(static_cast<std::uintptr_t>(device));
 
-	return { STATUS_SUCCESS, file_opened };
+		emu_object<_FILE_OBJECT>(*cpu.curr_addr_space(), file_object).write(body);
+
+		const auto result = emulator->dispatch_irp(cpu, {
+			.major = irp_mj_create,
+			.device_object = device,
+			.file_object = file_object,
+		});
+
+		auto host = std::make_shared<file_host>();
+		host->path = path;
+		host->device_object = device;
+		host->file_object = file_object;
+		host->builtin = builtin;
+
+		const std::uint8_t placeholder[sizeof(addr_t)] = {};
+		const auto addr = (result.status & 0x80000000u) == 0
+			? state.objs.create_object(0, placeholder, sizeof(placeholder), host,
+				prot_rw | prot_supervisor)
+			: 0;
+
+		if (!addr)
+		{
+			if (!builtin) state.pool.free(file_object);
+			THREAD_LOG_WARN("open_device('{}') refused, status=0x{:X}", path,
+				static_cast<std::uint32_t>(result.status));
+			return { (result.status & 0x80000000u) != 0 ? result.status : STATUS_INSUFFICIENT_RESOURCES, 0 };
+		}
+
+		if (file_handle)
+		{
+			const auto handle = state.sys_proc->handle_table().create_handle(addr, builtin ? access : 0);
+			try { file_handle.write(handle); }
+			catch (...)
+			{
+				if (builtin)
+				{
+					state.sys_proc->handle_table().close_handle(handle);
+					host->file_object = 0;
+				}
+				throw;
+			}
+		}
+		pool_guard.release();
+
+		THREAD_LOG_INFO("open_device('{}') -> device=0x{:X}, file object at 0x{:X}",
+			path, device, file_object);
+
+		return { STATUS_SUCCESS, file_opened };
+	}
+	catch (const std::bad_alloc&) { if (!builtin) throw; return {STATUS_INSUFFICIENT_RESOURCES, 0}; }
+	catch (...) { if (!builtin) throw; return {STATUS_ACCESS_VIOLATION, 0}; }
 }
 
 open_result write_file_information(addr_space& space, const file_host& host,
@@ -279,6 +321,8 @@ open_result open_file(win_kernel_state& state, const std::string& path,
 {
 	if (path.empty())
 		return { STATUS_OBJECT_NAME_INVALID, 0 };
+	if (reserved_raw_device_path(path))
+		return {STATUS_OBJECT_NAME_NOT_FOUND, 0};
 
 	const bool is_directory = state.fs.dir_exists(path);
 	const bool existed = state.fs.exists(path) || is_directory;
@@ -552,7 +596,7 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 			const auto device = st->find_device(path);
 
 			const auto result = device
-				? open_device(cpu, *st, device, path, file_handle)
+				? open_device(cpu, *st, device, path, file_handle, desired_access, disposition, create_options)
 				: open_file(*st, path, disposition, create_options, file_handle);
 
 			write_status_block(io_status_block, result);
@@ -653,7 +697,7 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 		const auto device = st->find_device(path);
 
 		const auto result = device
-			? open_device(cpu, *st, device, path, file_handle)
+			? open_device(cpu, *st, device, path, file_handle, desired_access, create_disposition, create_options)
 			: open_file(*st, path, create_disposition, create_options, file_handle);
 
 		write_status_block(io_status_block, result);
@@ -680,7 +724,7 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 			const auto device = st->find_device(path);
 
 			const auto result = device
-				? open_device(cpu, *st, device, path, file_handle)
+				? open_device(cpu, *st, device, path, file_handle, desired_access, file_open, open_options)
 				: open_file(*st, path, file_open, open_options, file_handle);
 
 			write_status_block(io_status_block, result);
@@ -696,9 +740,27 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 		[[maybe_unused]] const addr_t apc_routine, [[maybe_unused]] const addr_t apc_context,
 		emu_object<_IO_STATUS_BLOCK> io_status_block, const addr_t buffer,
 		const std::uint32_t length, emu_object<std::int64_t> byte_offset,
-		[[maybe_unused]] emu_object<std::uint32_t> key) -> NTSTATUS
+		[[maybe_unused]] emu_object<std::uint32_t> key, const bool zw) -> NTSTATUS
 	{
 		const auto host = st->sys_proc->handle_table().get_object<file_host>(file_handle);
+
+		if (host && host->builtin)
+		{
+			const auto device = st->objs.get_object<device_host>(host->device_object);
+			if (!device || !device->builtin) return STATUS_INVALID_DEVICE_REQUEST;
+			if (!io_status_block) return STATUS_ACCESS_VIOLATION;
+			try
+			{
+				const auto thread = std::dynamic_pointer_cast<win_thread>(cpu.thread());
+				if (!thread || !thread->ethread()) return STATUS_INVALID_PARAMETER;
+				const auto previous = thread->ethread().field(&_ETHREAD::Tcb).field(&_KTHREAD::PreviousMode).read();
+				if (previous != 0 && previous != 1) return STATUS_INVALID_PARAMETER;
+				return device->builtin->dispatch(*st, cpu, {.major = 3}, // IRP_MJ_READ
+					{.status_block = io_status_block.address(),
+					 .user = win::executing_user_mode(cpu) || (!zw && previous != 0)}).status;
+			}
+			catch (...) { return STATUS_ACCESS_VIOLATION; }
+		}
 
 		if (!host || !host->file)
 		{
@@ -743,9 +805,27 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 		[[maybe_unused]] const addr_t apc_routine, [[maybe_unused]] const addr_t apc_context,
 		emu_object<_IO_STATUS_BLOCK> io_status_block, const addr_t buffer,
 		const std::uint32_t length, emu_object<std::int64_t> byte_offset,
-		[[maybe_unused]] emu_object<std::uint32_t> key) -> NTSTATUS
+		[[maybe_unused]] emu_object<std::uint32_t> key, const bool zw) -> NTSTATUS
 	{
 		const auto host = st->sys_proc->handle_table().get_object<file_host>(file_handle);
+
+		if (host && host->builtin)
+		{
+			const auto device = st->objs.get_object<device_host>(host->device_object);
+			if (!device || !device->builtin) return STATUS_INVALID_DEVICE_REQUEST;
+			if (!io_status_block) return STATUS_ACCESS_VIOLATION;
+			try
+			{
+				const auto thread = std::dynamic_pointer_cast<win_thread>(cpu.thread());
+				if (!thread || !thread->ethread()) return STATUS_INVALID_PARAMETER;
+				const auto previous = thread->ethread().field(&_ETHREAD::Tcb).field(&_KTHREAD::PreviousMode).read();
+				if (previous != 0 && previous != 1) return STATUS_INVALID_PARAMETER;
+				return device->builtin->dispatch(*st, cpu, {.major = 4}, // IRP_MJ_WRITE
+					{.status_block = io_status_block.address(),
+					 .user = win::executing_user_mode(cpu) || (!zw && previous != 0)}).status;
+			}
+			catch (...) { return STATUS_ACCESS_VIOLATION; }
+		}
 
 		if (!host || (!host->file && !host->console))
 		{
@@ -1000,8 +1080,27 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 	};
 
 	state.redirect_ntzw(mod, "CreateFile", create_file);
-	state.redirect_ntzw(mod, "ReadFile", read_file);
-	state.redirect_ntzw(mod, "WriteFile", write_file);
+	for (const bool writing : {false, true})
+	{
+		const std::string nt = writing ? "NtWriteFile" : "NtReadFile";
+		const std::string zw_name = writing ? "ZwWriteFile" : "ZwReadFile";
+		for (const bool zw : {false, true})
+		{
+			if (zw && (!mod.find_symbol(zw_name) || mod.find_symbol(zw_name) == mod.find_symbol(nt))) continue;
+			state.redirect(mod, zw ? zw_name : nt,
+				[read_file, write_file, writing, zw](vcpu& cpu, const std::uint64_t file_handle,
+					const std::uint64_t event, const addr_t apc_routine, const addr_t apc_context,
+					emu_object<_IO_STATUS_BLOCK> io_status_block, const addr_t buffer,
+					const std::uint32_t length, emu_object<std::int64_t> byte_offset,
+					emu_object<std::uint32_t> key) -> NTSTATUS
+				{
+					if (writing) return write_file(cpu, file_handle, event, apc_routine, apc_context,
+						std::move(io_status_block), buffer, length, std::move(byte_offset), std::move(key), zw);
+					return read_file(cpu, file_handle, event, apc_routine, apc_context,
+						std::move(io_status_block), buffer, length, std::move(byte_offset), std::move(key), zw);
+				});
+		}
+	}
 	state.redirect_ntzw(mod, "QueryInformationFile", query_information_file);
 	state.redirect_ntzw(mod, "FlushBuffersFile", flush_buffers_file);
 	state.redirect_ntzw(mod, "QueryDirectoryFile", query_directory_file);
@@ -1029,7 +1128,7 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 		emu_object<_IO_STATUS_BLOCK> io_status_block, const std::uint32_t control_code,
 		const addr_t input_buffer, const std::uint32_t input_length,
 		const addr_t output_buffer, const std::uint32_t output_length,
-		const std::string_view who) -> NTSTATUS
+		const std::string_view who, bool zw = false, bool filesystem_control = false) -> NTSTATUS
 	{
 		const auto host = st->sys_proc->handle_table().get_object<file_host>(file_handle);
 
@@ -1054,6 +1153,34 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 		{
 			write_status_block(io_status_block, {STATUS_INVALID_DEVICE_REQUEST, 0});
 			return STATUS_INVALID_DEVICE_REQUEST;
+		}
+
+		if (host->builtin)
+		{
+			if (!io_status_block) return STATUS_ACCESS_VIOLATION;
+			builtin_io_context context{.status_block = io_status_block.address()};
+			try
+			{
+				const auto thread = std::dynamic_pointer_cast<win_thread>(cpu.thread());
+				if (!thread || !thread->ethread()) return STATUS_INVALID_PARAMETER;
+				const auto previous = thread->ethread().field(&_ETHREAD::Tcb).field(&_KTHREAD::PreviousMode).read();
+				if (previous != 0 && previous != 1) return STATUS_INVALID_PARAMETER;
+				context.user = win::executing_user_mode(cpu) || (!zw && previous != 0);
+				const auto entry = st->sys_proc->handle_table().lookup_handle(file_handle);
+				if (!entry) return STATUS_INVALID_HANDLE;
+				const auto required = (control_code >> 14) & 3u;
+				if (context.user && (entry->access & required) != required)
+					context.rejection = STATUS_ACCESS_DENIED;
+				if (event || apc_routine || apc_context) context.rejection = STATUS_NOT_SUPPORTED;
+				if (filesystem_control) context.rejection = STATUS_INVALID_DEVICE_REQUEST;
+				return emulator->dispatch_irp(cpu, {
+					.major = irp_mj_device_control, .device_object = host->device_object,
+					.file_object = host->file_object, .control_code = control_code,
+					.input_buffer = input_buffer, .input_length = input_length,
+					.output_buffer = output_buffer, .output_length = output_length,
+				}, context).status;
+			}
+			catch (...) { return STATUS_ACCESS_VIOLATION; }
 		}
 
 		const auto result = emulator->dispatch_irp(cpu, {
@@ -1082,27 +1209,24 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 		return result.status;
 	};
 
-	state.redirect_ntzw(mod, "DeviceIoControlFile",
-		[control_file](vcpu& cpu, const std::uint64_t file_handle, const addr_t event,
-			const addr_t apc_routine, const addr_t apc_context,
-			emu_object<_IO_STATUS_BLOCK> io_status_block, const std::uint32_t control_code,
-			const addr_t input_buffer, const std::uint32_t input_length,
-			const addr_t output_buffer, const std::uint32_t output_length) -> NTSTATUS
+	for (const bool filesystem : {false, true})
+	{
+		const std::string nt = filesystem ? "NtFsControlFile" : "NtDeviceIoControlFile";
+		const std::string zw_name = filesystem ? "ZwFsControlFile" : "ZwDeviceIoControlFile";
+		for (const bool zw : {false, true})
 		{
-			return control_file(cpu, file_handle, event, apc_routine, apc_context,
-				std::move(io_status_block), control_code, input_buffer, input_length,
-				output_buffer, output_length, "NtDeviceIoControlFile");
-		});
-
-	state.redirect_ntzw(mod, "FsControlFile",
-		[control_file](vcpu& cpu, const std::uint64_t file_handle, const addr_t event,
-			const addr_t apc_routine, const addr_t apc_context,
-			emu_object<_IO_STATUS_BLOCK> io_status_block, const std::uint32_t control_code,
-			const addr_t input_buffer, const std::uint32_t input_length,
-			const addr_t output_buffer, const std::uint32_t output_length) -> NTSTATUS
-		{
-			return control_file(cpu, file_handle, event, apc_routine, apc_context,
-				std::move(io_status_block), control_code, input_buffer, input_length,
-				output_buffer, output_length, "NtFsControlFile");
-		});
+			if (zw && (!mod.find_symbol(zw_name) || mod.find_symbol(zw_name) == mod.find_symbol(nt))) continue;
+			state.redirect(mod, zw ? zw_name : nt,
+				[control_file, zw, filesystem, nt](vcpu& cpu, const std::uint64_t file_handle, const addr_t event,
+					const addr_t apc_routine, const addr_t apc_context,
+					emu_object<_IO_STATUS_BLOCK> io_status_block, const std::uint32_t control_code,
+					const addr_t input_buffer, const std::uint32_t input_length,
+					const addr_t output_buffer, const std::uint32_t output_length) -> NTSTATUS
+				{
+					return control_file(cpu, file_handle, event, apc_routine, apc_context,
+						std::move(io_status_block), control_code, input_buffer, input_length,
+						output_buffer, output_length, nt, zw, filesystem);
+				});
+		}
+	}
 }
