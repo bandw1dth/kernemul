@@ -51,12 +51,14 @@ void modules::register_ntoskrnl_wait_ops(win_kernel_state& state, proc_module& m
 		}
 
 		auto wait = make_wait(std::move(objects), wait_type, timeout, st->clock.sample());
+		if (wait.timed && !wait.monotonic && wait.deadline == 0)
+			return t->poll_wait(cpu, std::move(wait));
 
 		THREAD_LOG_INFO("{}: waiting on {} object(s), {}{}",
 			who, wait.objects.size(), wait.all ? "all of them, " : "",
 			wait.timed ? "with a timeout" : "with no timeout");
 
-		t->begin_wait(std::move(wait));
+		t->begin_wait(cpu, std::move(wait));
 
 		t->try_satisfy(*cpu.curr_addr_space());
 
@@ -176,6 +178,8 @@ void modules::register_ntoskrnl_wait_ops(win_kernel_state& state, proc_module& m
 
 			if (!signal || !object)
 				return STATUS_INVALID_HANDLE;
+
+			thread_scheduler::require_can_yield(cpu);
 
 			auto& space = *cpu.curr_addr_space();
 

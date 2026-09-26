@@ -2,6 +2,7 @@
 #include <format>
 #include "../thread_scheduler.hpp"
 #include "ethread.hpp"
+#include "per_cpu.hpp"
 #include "process.hpp"
 #include "status.hpp"
 #include "user_setup.hpp"
@@ -43,6 +44,7 @@ public:
 
 	void save(vcpu& cpu) override;
 	void restore(vcpu& cpu) const override;
+	[[nodiscard]] bool can_switch(vcpu& cpu) const override;
 
 	void set_ethread(emu_object<_ETHREAD> et) { ethread_ = std::move(et); }
 	[[nodiscard]] const emu_object<_ETHREAD>& ethread() const { return ethread_; }
@@ -64,7 +66,8 @@ public:
 		NTSTATUS timeout_status = STATUS_TIMEOUT;
 	};
 
-	void begin_wait(wait_state w);
+	void begin_wait(vcpu& cpu, wait_state w);
+	NTSTATUS poll_wait(vcpu& cpu, wait_state w);
 
 	[[nodiscard]] bool is_waiting() const { std::scoped_lock lock(wait_mutex_); return wait_.has_value(); }
 	[[nodiscard]] bool waiting_on(const addr_t object) const
@@ -126,6 +129,8 @@ public:
 	[[nodiscard]] bool is_user_mode() const override { return !is_system_thread(); }
 
 protected:
+	irql_t saved_irql_ = passive_level;
+	bool try_satisfy(addr_space& space, wait_state& wait);
 	std::vector<attachment_frame> attachments_;
 	std::vector<std::size_t> attachment_floors_;
 	mutable std::recursive_mutex wait_mutex_;

@@ -7,9 +7,15 @@
 #include "../../emu/calling_conv.hpp"
 #include "win_kernel.hpp"
 
+bool win_thread::can_switch(vcpu& cpu) const
+{
+	return !emulator_ || emulator_->irql(cpu) < dispatch_level;
+}
+
 void win_thread::save(vcpu& cpu)
 {
 	thread::save(cpu);
+	if (emulator_) saved_irql_ = emulator_->irql(cpu);
 
 	if (const auto* pcpu = emulator_ ? emulator_->per_cpu(cpu) : nullptr)
 		pcpu->set_current_thread(0);
@@ -32,6 +38,8 @@ void win_thread::restore(vcpu& cpu) const
 	if (!emulator_)
 		return;
 
+	emulator_->set_irql(cpu, saved_irql_);
+
 	const auto* pcpu = emulator_->per_cpu(cpu);
 
 	if (!pcpu)
@@ -52,13 +60,22 @@ void win_thread::restore(vcpu& cpu) const
 	count_thread_switch(ethread_);
 }
 
-void win_thread::begin_wait(wait_state w)
+namespace
+{
+void check_wait_callbacks()
 {
 	if (win::process_callback_depth) throw std::runtime_error("process notify: callback cannot begin a wait");
 	if (win::ob_callback_depth) throw std::runtime_error("ob notify: callback cannot begin a wait");
 	if (win::registry_callback_depth) throw std::runtime_error("registry notify: callback cannot begin a wait");
 	if (win::image_callback_depth) throw std::runtime_error("image callback cannot begin a wait");
+}
+}
+
+void win_thread::begin_wait(vcpu& cpu, wait_state w)
+{
+	check_wait_callbacks();
 	if (win::in_dpc_callback) throw std::runtime_error("DPC cannot begin a wait");
+	thread_scheduler::require_can_yield(cpu);
 	std::scoped_lock lock(wait_mutex_);
 	if (w.timed)
 	{
@@ -78,15 +95,29 @@ bool win_thread::try_satisfy(addr_space& space)
 	std::scoped_lock lock(wait_mutex_);
 	if (!wait_ || wait_->satisfied)
 		return false;
+	return try_satisfy(space, *wait_);
+}
 
+NTSTATUS win_thread::poll_wait(vcpu& cpu, wait_state w)
+{
+	check_wait_callbacks();
+	if (emulator_ && emulator_->irql(cpu) > dispatch_level)
+		thread_scheduler::reject_current(cpu, "IRQL above DISPATCH_LEVEL cannot poll a wait");
+	std::scoped_lock dispatcher_lock(win::dispatcher_mutex);
+	return try_satisfy(*cpu.curr_addr_space(), w) ? w.status : STATUS_TIMEOUT;
+}
+
+// Caller holds dispatcher_mutex. A poll uses a local wait, never publishing it.
+bool win_thread::try_satisfy(addr_space& space, wait_state& wait)
+{
 	const auto self = ethread_.address();
 
 	// WaitAll takes none of the objects until every one is available.
-	std::size_t taken = wait_->objects.size();
+	std::size_t taken = wait.objects.size();
 
-	if (wait_->all)
+	if (wait.all)
 	{
-		for (const auto object : wait_->objects)
+		for (const auto object : wait.objects)
 		{
 			if (!win::is_signalled(space, object, self))
 				return false;
@@ -94,37 +125,37 @@ bool win_thread::try_satisfy(addr_space& space)
 	}
 	else
 	{
-		taken = wait_->objects.size() + 1;
+		taken = wait.objects.size() + 1;
 
-		for (std::size_t i = 0; i < wait_->objects.size(); ++i)
+		for (std::size_t i = 0; i < wait.objects.size(); ++i)
 		{
-			if (win::is_signalled(space, wait_->objects[i], self))
+			if (win::is_signalled(space, wait.objects[i], self))
 			{
 				taken = i;
 				break;
 			}
 		}
 
-		if (taken > wait_->objects.size())
+		if (taken > wait.objects.size())
 			return false;
 	}
 
-	if (wait_->all)
+	if (wait.all)
 	{
-		for (const auto object : wait_->objects)
+		for (const auto object : wait.objects)
 			win::take(space, object, self);
 
-		wait_->status = STATUS_SUCCESS;
+		wait.status = STATUS_SUCCESS;
 	}
 	else
 	{
-		win::take(space, wait_->objects[taken], self);
+		win::take(space, wait.objects[taken], self);
 
 		// STATUS_WAIT_0 is zero, so the index of the object that released it is the status.
-		wait_->status = static_cast<NTSTATUS>(taken);
+		wait.status = static_cast<NTSTATUS>(taken);
 	}
 
-	wait_->satisfied = true;
+	wait.satisfied = true;
 
 	return true;
 }

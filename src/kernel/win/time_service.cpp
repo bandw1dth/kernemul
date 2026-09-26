@@ -16,7 +16,7 @@ NTSTATUS win_kernel_state::delay_thread(vcpu& cpu, std::int64_t due)
 	wait.deadline = due < 0 ? win::saturated_add(now.interrupt_time,
 		std::uint64_t{0} - static_cast<std::uint64_t>(due)) : static_cast<std::uint64_t>(due);
 	wait.timeout_status = STATUS_SUCCESS;
-	t->begin_wait(std::move(wait));
+	t->begin_wait(cpu, std::move(wait));
 	thread_scheduler::yield_current(cpu);
 	return STATUS_SUCCESS;
 }

@@ -43,6 +43,9 @@ public:
 
 	virtual ~thread() = default;
 
+	// Asked only on the host thread executing this CPU, with its live register state.
+	[[nodiscard]] virtual bool can_switch(vcpu&) const { return true; }
+
 	[[nodiscard]] virtual std::shared_ptr<addr_space> execution_addr_space() const { return proc()->addr_space(); }
 
 	virtual void save(vcpu& cpu)
@@ -303,15 +306,31 @@ public:
 		cv_.notify_all();
 	}
 
-	static void yield_current(vcpu& cpu)
+	[[noreturn]] static void reject_current(vcpu& cpu, const char* reason)
+	{
+		// Redirects may catch the exception; shutdown must still win the switch veto.
+		if (const auto t = cpu.thread())
+			if (const auto p = t->proc(); p && p->scheduler()) p->scheduler()->stop();
+		cpu.stop();
+		throw std::runtime_error(reason);
+	}
+
+	static void require_can_yield(vcpu& cpu)
 	{
 		if (cpu.in_dpc) throw std::runtime_error("DPC cannot block or yield");
+		if (const auto t = cpu.thread(); t && !t->can_switch(cpu))
+			reject_current(cpu, "current execution level cannot block or yield");
+	}
+
+	static void yield_current(vcpu& cpu)
+	{
+		require_can_yield(cpu);
 		cpu.stop();
 	}
 
 	static void sleep_current(vcpu& cpu, const std::chrono::milliseconds ms)
 	{
-		if (cpu.in_dpc) throw std::runtime_error("DPC cannot sleep");
+		require_can_yield(cpu);
 		if (const auto t = cpu.thread())
 			t->sleep_for(ms);
 
@@ -348,6 +367,10 @@ public:
 	std::shared_ptr<thread> schedule(vcpu& cpu, std::shared_ptr<thread> prev = nullptr)
 	{
 		std::unique_lock lock(mtx_);
+
+		// Shutdown takes the normal save/stop path even at elevated execution levels.
+		// Otherwise retain the live context without saving, requeueing, or borrowing it.
+		if (!stopped_ && prev && !prev->can_switch(cpu)) return prev;
 
 		if (prev)
 		{

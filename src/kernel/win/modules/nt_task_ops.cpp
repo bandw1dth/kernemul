@@ -778,6 +778,7 @@ void modules::register_ntoskrnl_task_ops(win_kernel_state& state, proc_module& m
 		if (st->in_lifecycle_callback(cpu.id()))
 			st->fail_thread_notify(cpu, "NtSuspendThread: self-suspension inside a lifecycle callback is unsupported");
 
+		if (t == cpu.thread()) thread_scheduler::require_can_yield(cpu);
 		const auto previous = t->suspend();
 
 		if (previous_count)
@@ -843,6 +844,7 @@ void modules::register_ntoskrnl_task_ops(win_kernel_state& state, proc_module& m
 		if (!t)
 			return STATUS_INVALID_PARAMETER;
 
+		thread_scheduler::require_can_yield(cpu);
 		if (t->take_alert())
 		{
 			THREAD_LOG_INFO("NtWaitForAlertByThreadId(0x{:X}): an alert was already in hand",
@@ -860,7 +862,7 @@ void modules::register_ntoskrnl_task_ops(win_kernel_state& state, proc_module& m
 		THREAD_LOG_INFO("NtWaitForAlertByThreadId(0x{:X}): parked {}",
 			address, wait.timed ? "with a timeout" : "with no timeout");
 
-		t->begin_wait(std::move(wait));
+		t->begin_wait(cpu, std::move(wait));
 		thread_scheduler::yield_current(cpu);
 
 		return STATUS_SUCCESS;

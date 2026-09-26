@@ -703,19 +703,16 @@ public:
 	// Every handler that moves the IRQL goes through here, so the two copies cannot drift.
 	irql_t set_irql(vcpu& cpu, const irql_t irql)
 	{
+		const auto old = this->irql(cpu);
 		const auto* pcpu = per_cpu(cpu);
 
-		if (!pcpu)
-			return passive_level;
-
-		const auto old = pcpu->irql();
-		pcpu->set_irql(irql);
+		if (pcpu) pcpu->set_irql(irql);
 		set_hw_irql(cpu, irql);
 
 		return old;
 	}
 
-	[[nodiscard]] irql_t irql(vcpu& cpu)
+	[[nodiscard]] virtual irql_t irql(vcpu& cpu)
 	{
 		const auto* pcpu = per_cpu(cpu);
 		return pcpu ? pcpu->irql() : passive_level;
@@ -941,7 +938,14 @@ public:
 	user_process_args create_user_process(vcpu& cpu, std::string_view exe_name);
 
 private:
-	void timekeeper_tick() override { kernel_.update_time(); }
+	void timekeeper_tick() override
+	{
+		kernel_.update_time();
+		// Retry deferred DPCs without reading CPU registers on the clock thread.
+		// The work_pending callback gates dispatch using the executing CPU's live IRQL.
+		if (kernel_.dpc_count.load() && !kernel_.dpc_running.load())
+			scheduler_.request_kernel_work();
+	}
 	win_kernel_state kernel_;
 };
 

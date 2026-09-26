@@ -116,6 +116,15 @@ public:
 		cpu.reg(x86::cr8, static_cast<std::uint64_t>(irql));
 	}
 
+	[[nodiscard]] irql_t irql(vcpu& cpu) override
+	{
+		// Guest MOV CR8 bypasses the hooked IRQL APIs. Hardware is authoritative.
+		const auto level = static_cast<irql_t>(cpu.reg<std::uint64_t>(x86::cr8));
+		if (const auto* pcpu = per_cpu(cpu); pcpu && pcpu->irql() != level)
+			pcpu->set_irql(level);
+		return level;
+	}
+
 	void set_kernel_mode(vcpu& cpu, const bool kernel) override
 	{
 		if (kernel)

@@ -492,6 +492,7 @@ void modules::register_ntoskrnl_dispatch_ops(win_kernel_state& state, proc_modul
 		if (!t)
 			return STATUS_INVALID_PARAMETER;
 
+		thread_scheduler::require_can_yield(cpu);
 		const auto gate = host->gate_for(*st, key);
 
 		if (!gate.arrivals || !gate.releases)
@@ -521,7 +522,7 @@ void modules::register_ntoskrnl_dispatch_ops(win_kernel_state& state, proc_modul
 			releasing ? "NtReleaseKeyedEvent" : "NtWaitForKeyedEvent",
 			handle, key, post, wait_on);
 
-		t->begin_wait(std::move(wait));
+		t->begin_wait(cpu, std::move(wait));
 		t->try_satisfy(space);
 
 		thread_scheduler::yield_current(cpu);

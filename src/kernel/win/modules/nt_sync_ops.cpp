@@ -57,6 +57,7 @@ bool take_mutex(vcpu& cpu, const emu_object<_FAST_MUTEX>& mutex, const std::stri
 		return true;
 	}
 
+	thread_scheduler::require_can_yield(cpu);
 	auto contention = mutex.field(&_FAST_MUTEX::Contention);
 	contention.write(contention.read() + 1);
 
@@ -79,7 +80,7 @@ bool take_mutex(vcpu& cpu, const emu_object<_FAST_MUTEX>& mutex, const std::stri
 	win_thread::wait_state w{};
 	w.objects = { mutex.field(&_FAST_MUTEX::Event).address() };
 
-	t->begin_wait(std::move(w));
+	t->begin_wait(cpu, std::move(w));
 	t->try_satisfy(*cpu.curr_addr_space());
 
 	thread_scheduler::yield_current(cpu);
@@ -159,6 +160,7 @@ void register_fast_mutexes(win_kernel_state& state, proc_module& mod)
 		if (!mutex)
 			return;
 
+		thread_scheduler::require_can_yield(cpu);
 		auto* emulator = st->emulator();
 		const auto old_irql = emulator ? emulator->set_irql(cpu, apc_level) : passive_level;
 
