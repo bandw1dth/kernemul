@@ -157,3 +157,50 @@ Independent re-review confirmed the finding resolved with no further material
 finding. Physical-alias and backend-write-failure paths and multi-vCPU races
 remain untested; staged writes do not promise atomic visibility to concurrent
 readers. This is bounded emulator conformance, not a matching Windows VM run.
+
+## Bounded VGK capture
+
+Implementation commit: `32db993`. The frozen WHP capture is
+`build-conformance/kernel-20260926-232326-759`. It uses local-only lab commit
+`111dbeb9ebb068ef26b081277db5955990e98c2b` and executable SHA-256
+`CB6BBE98132E859B1419FD8FE1055362A91208086C089B7A7DB7B2E38AF8E9AD`.
+The author-provided in-memory DEBUGCTL compatibility patch remains on that local
+branch. The generic branch and validated executable were restored after freezing
+the run. The only native companion is the process-notification fixture; the
+user-mode service is not run.
+
+VGK initialization returned `STATUS_SUCCESS` at 23:23:37.272. Its storage
+observations changed as follows from the preceding UEFI capture
+(`kernel-20260926-223635-224`):
+
+| Observation | Before | Storage pass |
+| --- | --- | --- |
+| PhysicalDrive0 | Ordinary file with no device handler | Named synthetic disk, opened twice |
+| ATA request `0x4D02C` | No device handler | `STATUS_BUFFER_TOO_SMALL`, zero bytes; captured malformed request preserved |
+| Property request `0x2D1400` | No device handler | Successful 8-byte size probe, then successful 94-byte descriptor read |
+| PhysicalDrive1–4 | Fake files, eight unsupported IOCTLs | Eight opens return `STATUS_OBJECT_NAME_NOT_FOUND` |
+
+The extra full-descriptor request is new target behavior enabled by the successful
+size probe. The driver now receives coherent identity metadata for the configured
+disk while absent disks remain absent. Valid ATA IDENTIFY requests are covered by
+the model, kernel and native fixtures; this VGK capture does not issue a valid one.
+
+The run completed **210.044 seconds** and was deliberately stopped at the limit
+(host exit code `-1`). The shared three-minute timer first read signaled at
+23:26:29.016, with 19 signaled reads before the deadline. There were 142 handled
+exceptions, zero unhandled exceptions, zero API/callback faults and no executed
+unimplemented functions. The three startup errors were only the known optional
+IRQL export hooks; stderr was empty.
+
+The trace contains exactly three storage controls: the rejected ATA request and
+the two successful property queries. No old "not a device" storage warnings
+remain. Firmware still reports three successful reads and nine absent variables;
+CI reports two trusted SHA-256 checks and six digest/algorithm mismatches. Four
+process callbacks were delivered, with four balanced attach/detach pairs.
+
+The physical-memory resource-map registry key remains absent, and the
+`E00000EF` diagnostic involving `fltmgr.sys` remains. Those are not resolved by
+this identification-only disk model. The target file stayed unchanged at SHA-256
+`3CB2F36CF9F3B66BF63561D24649422D852229F2C788A7AAA783752DCE4AB39F`.
+The frozen manifest, stdout/stderr and `storage-summary.json` preserve the local
+capture evidence; generated binaries and traces are not committed.
