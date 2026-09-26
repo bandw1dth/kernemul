@@ -2,8 +2,11 @@
 #include "storage_device.hpp"
 #include "win_kernel.hpp"
 #include "process_params.hpp"
+#include "physical_memory_resources.hpp"
+#include "types.hpp"
 #include "../../util/log.hpp"
 
+#include <cstddef>
 #include <string>
 
 // Nothing in the emulator itself reads the registry -- it exists purely as a guest visible store
@@ -19,6 +22,26 @@ namespace
 {
 
 constexpr std::string_view control_key = "system/currentcontrolset/control";
+
+static_assert(win::physical_memory_resources::page_bytes == guest_page_size);
+static_assert(offsetof(CM_RESOURCE_LIST, Count) == 0);
+static_assert(offsetof(CM_RESOURCE_LIST, List) == 4);
+static_assert(sizeof(CM_RESOURCE_LIST) == 0x28);
+static_assert(offsetof(CM_FULL_RESOURCE_DESCRIPTOR, InterfaceType) == 0);
+static_assert(offsetof(CM_FULL_RESOURCE_DESCRIPTOR, BusNumber) == 4);
+static_assert(offsetof(CM_FULL_RESOURCE_DESCRIPTOR, PartialResourceList) == 8);
+static_assert(sizeof(CM_FULL_RESOURCE_DESCRIPTOR) == 0x24);
+static_assert(offsetof(CM_PARTIAL_RESOURCE_LIST, Version) == 0);
+static_assert(offsetof(CM_PARTIAL_RESOURCE_LIST, Revision) == 2);
+static_assert(offsetof(CM_PARTIAL_RESOURCE_LIST, Count) == 4);
+static_assert(offsetof(CM_PARTIAL_RESOURCE_LIST, PartialDescriptors) == 8);
+static_assert(sizeof(CM_PARTIAL_RESOURCE_LIST) == 0x1C);
+static_assert(offsetof(CM_PARTIAL_RESOURCE_DESCRIPTOR, Type) == 0);
+static_assert(offsetof(CM_PARTIAL_RESOURCE_DESCRIPTOR, ShareDisposition) == 1);
+static_assert(offsetof(CM_PARTIAL_RESOURCE_DESCRIPTOR, Flags) == 2);
+static_assert(offsetof(CM_PARTIAL_RESOURCE_DESCRIPTOR, u.Memory.Start) == 4);
+static_assert(offsetof(CM_PARTIAL_RESOURCE_DESCRIPTOR, u.Memory.Length) == 12);
+static_assert(sizeof(CM_PARTIAL_RESOURCE_DESCRIPTOR) == 0x14);
 
 }
 
@@ -75,6 +98,17 @@ void win::seed_registry(win_kernel_state& state)
 	// openable even when it holds nothing.
 	static_cast<void>(reg.create_key("system/currentcontrolset/services"));
 	static_cast<void>(reg.create_key("hardware/devicemap"));
+
+	const auto [physical_base, physical_bytes] = state.kernel_space().mmu_->phys_range();
+	const win::physical_memory_resources::range physical_range{
+		static_cast<std::uint64_t>(physical_base), static_cast<std::uint64_t>(physical_bytes)
+	};
+	const auto translated = win::physical_memory_resources::encode(
+		std::span<const win::physical_memory_resources::range>(&physical_range, 1));
+	reg.create_key("hardware/resourcemap/system resources/physical memory")
+		->set_value(".Translated", registry_type::resource_list, translated.bytes);
+	LOG_INFO("registry: seeded physical memory base=0x{:X} bytes=0x{:X} ranges=1 descriptors={}",
+		physical_base, physical_bytes, translated.descriptor_count);
 
 	LOG_INFO("registry: seeded boot state, build {}", state.nt_build_number);
 }

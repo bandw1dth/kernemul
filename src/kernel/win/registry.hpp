@@ -20,6 +20,7 @@ enum class registry_type : std::uint32_t
 	dword_be  = 5,
 	link      = 6,
 	multi_sz  = 7,
+	resource_list = 8,
 	qword     = 11,
 };
 

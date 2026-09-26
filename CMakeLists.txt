@@ -296,6 +296,7 @@ set(kernemul_SOURCES
 	"src/kernel/win/ob_notify.hpp"
 	"src/kernel/win/objects.hpp"
 	"src/kernel/win/per_cpu.hpp"
+	"src/kernel/win/physical_memory_resources.hpp"
 	"src/kernel/win/pool.cpp"
 	"src/kernel/win/pool.hpp"
 	"src/kernel/win/process.cpp"
