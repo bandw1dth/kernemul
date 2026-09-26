@@ -499,7 +499,10 @@ bool x86_whp_emu::try_dispatch_syscall(insn_hk_cb& cb, const addr_t start, const
 
 	// A fault leaves the pc on the instruction, which is where the aarch64 hook hands its
 	// callback the pc and what dispatch_syscall measures a handler's move against.
-	if (!cb(*cpu))
+	const bool moved_pc = cb(*cpu);
+	sync_syscall_enable(*cpu);
+
+	if (!moved_pc)
 		cpu->set_pc(pc + sizeof(syscall_insn));
 
 	return true;

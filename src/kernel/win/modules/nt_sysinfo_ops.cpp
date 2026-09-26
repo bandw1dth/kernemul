@@ -918,11 +918,12 @@ void modules::register_ntoskrnl_sysinfo_ops(win_kernel_state& state, proc_module
 	});
 
 	state.redirect_ntzw(mod, "DuplicateObject",
-		[st](vcpu&, const std::uint64_t source_process_handle,
+		[st](vcpu& cpu, const std::uint64_t source_process_handle,
 			const std::uint64_t source_handle, const std::uint64_t target_process_handle,
 			emu_object<std::uint64_t> target_handle, const std::uint32_t desired_access,
 			const std::uint32_t handle_attributes, const std::uint32_t options) -> NTSTATUS
 		{
+            if (st->ob_notify.in_callback(cpu.id())) st->fail_ob_notify(cpu, "nested handle operations are unsupported");
 			constexpr std::uint32_t duplicate_close_source = 0x1;
 			constexpr std::uint32_t duplicate_same_access = 0x2;
 
@@ -942,18 +943,12 @@ void modules::register_ntoskrnl_sysinfo_ops(win_kernel_state& state, proc_module
 
 			const auto access = (options & duplicate_same_access) ? entry->access : desired_access;
 
-			st->objs.reference_object(entry->body_addr);
-			const auto duplicate = handles.create_handle(entry->body_addr, access);
-
-			if (target_handle)
-				target_handle.write(duplicate);
-
-			if (options & duplicate_close_source)
-				handles.close_handle(source_handle);
-
-			THREAD_LOG_INFO("NtDuplicateObject(0x{:X}, access=0x{:X}, attributes=0x{:X}, "
-				"options=0x{:X}) -> 0x{:X}",
-				source_handle, access, handle_attributes, options, duplicate);
+            if (options & ~7u) return STATUS_INVALID_PARAMETER;
+            const auto attributes = (options & 4u) ? entry->attributes : handle_attributes;
+            const auto status = st->create_ob_handle(cpu, entry->body_addr, access, attributes,
+                target_handle, 2, entry->access);
+            if (status != STATUS_SUCCESS) return status;
+            if (options & duplicate_close_source) handles.close_handle(source_handle);
 
 			return STATUS_SUCCESS;
 		});

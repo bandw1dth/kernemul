@@ -53,6 +53,7 @@ void win_thread::restore(vcpu& cpu) const
 
 void win_thread::begin_wait(wait_state w)
 {
+	if (win::ob_callback_depth) throw std::runtime_error("ob notify: callback cannot begin a wait");
 	if (win::registry_callback_depth) throw std::runtime_error("registry notify: callback cannot begin a wait");
 	if (win::image_callback_depth) throw std::runtime_error("image callback cannot begin a wait");
 	if (win::in_dpc_callback) throw std::runtime_error("DPC cannot begin a wait");

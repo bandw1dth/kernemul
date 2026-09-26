@@ -1,8 +1,8 @@
 #Requires -Version 7.0
 param(
     [string]$Executable = 'build-x64-whp\Release\kernemul.exe',
-    [ValidateSet('callback_failure_delay', 'callback_failure_wait', 'core_failure_unsupported_dpc', 'core_failure_nested_dpc', 'thread_notify_failure_delay', 'thread_notify_failure_remove', 'thread_notify_failure_api', 'thread_notify_failure_suspend', 'image_notify_failure_delay', 'image_notify_failure_remove', 'image_notify_failure_api', 'image_notify_failure_exit', 'image_noexecute_enforcement', 'registry_notify_failure_delay', 'registry_notify_failure_remove', 'registry_notify_failure_api', 'registry_notify_failure_terminate')]
-    [string[]]$Driver = @('callback_failure_delay', 'callback_failure_wait', 'core_failure_unsupported_dpc', 'core_failure_nested_dpc', 'thread_notify_failure_delay', 'thread_notify_failure_remove', 'thread_notify_failure_api', 'thread_notify_failure_suspend', 'image_notify_failure_delay', 'image_notify_failure_remove', 'image_notify_failure_api', 'image_notify_failure_exit', 'image_noexecute_enforcement', 'registry_notify_failure_delay', 'registry_notify_failure_remove', 'registry_notify_failure_api', 'registry_notify_failure_terminate'),
+    [ValidateSet('callback_failure_delay', 'callback_failure_wait', 'core_failure_unsupported_dpc', 'core_failure_nested_dpc', 'thread_notify_failure_delay', 'thread_notify_failure_remove', 'thread_notify_failure_api', 'thread_notify_failure_suspend', 'image_notify_failure_delay', 'image_notify_failure_remove', 'image_notify_failure_api', 'image_notify_failure_exit', 'image_noexecute_enforcement', 'registry_notify_failure_delay', 'registry_notify_failure_remove', 'registry_notify_failure_api', 'registry_notify_failure_terminate', 'ob_notify_failure_delay', 'ob_notify_failure_remove', 'ob_notify_failure_api', 'ob_notify_failure_return', 'ob_notify_failure_nested')]
+    [string[]]$Driver = @('callback_failure_delay', 'callback_failure_wait', 'core_failure_unsupported_dpc', 'core_failure_nested_dpc', 'thread_notify_failure_delay', 'thread_notify_failure_remove', 'thread_notify_failure_api', 'thread_notify_failure_suspend', 'image_notify_failure_delay', 'image_notify_failure_remove', 'image_notify_failure_api', 'image_notify_failure_exit', 'image_noexecute_enforcement', 'registry_notify_failure_delay', 'registry_notify_failure_remove', 'registry_notify_failure_api', 'registry_notify_failure_terminate', 'ob_notify_failure_delay', 'ob_notify_failure_remove', 'ob_notify_failure_api', 'ob_notify_failure_return', 'ob_notify_failure_nested'),
     [ValidateRange(1, 25)][int]$TimeoutSeconds = 25
 )
 $ErrorActionPreference = 'Stop'
@@ -45,6 +45,13 @@ foreach ($name in $Driver) {
             'API' { $required.diagnostic = 'ntoskrnl\.exe!KeSetTimerEx faulted: negative KeSetTimerEx period' }
             'TERMINATE' { $required.termination = 'PsTerminateSystemThread\(0x0\): tid=[0-9]+ ends here' }
         }
+        $forbiddenPattern = 'FORBIDDEN_|SETUP_FAILED|CONFORMANCE FAIL'
+    } elseif ($name -like 'ob_notify_failure_*') {
+        $kind = $name.Substring('ob_notify_failure_'.Length).ToUpperInvariant()
+        $required.preOperation = "DbgPrint: OB_NOTIFY_$kind PRE_OPERATION"
+        $required.callbackBegin = "DbgPrint: OB_NOTIFY_$kind PRE_$kind"
+        $required.dispatchFailure = 'ob notify: callback failed before returning; stopped'
+        $required.restoredContext = 'ob notify: restored irql=0, kernel_apc_disable=0, special_apc_disable=0'
         $forbiddenPattern = 'FORBIDDEN_|SETUP_FAILED|CONFORMANCE FAIL'
     } elseif ($name -like 'image_notify_failure_*') {
         $required.preMap = 'DbgPrint: IMAGE_NOTIFY_FAILURE PRE_MAP'
@@ -101,6 +108,11 @@ foreach ($name in $Driver) {
         if ($markers[$key] -ne 1) { $passed = $false }
     }
     if ($name -like 'registry_notify_failure_*') {
+        $operationPosition = $log.IndexOf($required.preOperation, [StringComparison]::Ordinal)
+        $callbackPosition = $log.IndexOf($required.callbackBegin, [StringComparison]::Ordinal)
+        $markers.operationBeforeCallback = $operationPosition -ge 0 -and $callbackPosition -gt $operationPosition
+        if (-not $markers.operationBeforeCallback) { $passed = $false }
+    } elseif ($name -like 'ob_notify_failure_*') {
         $operationPosition = $log.IndexOf($required.preOperation, [StringComparison]::Ordinal)
         $callbackPosition = $log.IndexOf($required.callbackBegin, [StringComparison]::Ordinal)
         $markers.operationBeforeCallback = $operationPosition -ge 0 -and $callbackPosition -gt $operationPosition

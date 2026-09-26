@@ -16,11 +16,12 @@ public:
 	{
 		addr_t body_addr;
 		access_t access;
+		std::uint32_t attributes = 0;
 	};
 
 	explicit win_handle_table(win_obj_manager& objs);
 
-	handle_t create_handle(addr_t body_addr, access_t access);
+	handle_t create_handle(addr_t body_addr, access_t access, std::uint32_t attributes = 0);
 	bool close_handle(handle_t handle);
 	[[nodiscard]] std::optional<handle_entry> lookup_handle(handle_t handle) const;
 	[[nodiscard]] win_obj_manager& objs() { return objs_; }

@@ -10,6 +10,7 @@
 #include "boot_seed.hpp"
 #include "registry.hpp"
 #include "registry_notify.hpp"
+#include "ob_notify.hpp"
 #include "filesystem.hpp"
 #include "ethread.hpp"
 #include "thread.hpp"
@@ -59,8 +60,17 @@ struct win_kernel_state : kernel_state
 	// Modern Windows supports up to 64 load-image registrations per instance.
 	win::lifecycle_notify_registry image_notify{64};
 	win::registry_notify_service registry_notify;
+	win::ob_notify_service ob_notify;
+	addr_t ob_process_type = 0, ob_thread_type = 0;
+	addr_t ob_object_type(addr_t object);
+	[[noreturn]] void fail_ob_notify(vcpu& cpu, const char* reason);
+	void call_ob_notify(vcpu& cpu, addr_t routine, addr_t context, addr_t information, bool pre,
+		const std::function<void()>& validate);
+	NTSTATUS create_ob_handle(vcpu& cpu, addr_t object, std::uint32_t access,
+		std::uint32_t attributes, emu_object<std::uint64_t> output,
+		std::uint32_t operation = 1, std::uint32_t access_ceiling = 0xffffffff);
 	bool in_lifecycle_callback(std::size_t cpu) const
-	{ return thread_notify.in_callback(cpu) || image_notify.in_callback(cpu) || registry_notify.in_callback(cpu); }
+	{ return thread_notify.in_callback(cpu) || image_notify.in_callback(cpu) || registry_notify.in_callback(cpu) || ob_notify.in_callback(cpu); }
 	NTSTATUS call_registry_notify(vcpu& cpu, const win::registry_notify_service::record& registration,
 		std::uint32_t notification, addr_t information);
 	void notify_image(vcpu& cpu, std::string_view path, addr_t base, std::uint64_t size);
@@ -596,6 +606,7 @@ private:
 
 		std::scoped_lock lock(list_mtx_);
 		auto obj = active_process_list.push_back(ep);
+		objs.register_object(obj.address(), std::make_shared<process_identity_object>());
 
 		kprocess_thread_list(space, obj.address(),
 			std::format("KPROCESS.ThreadListHead[pid={}]", id), true).init();
@@ -717,7 +728,7 @@ public:
 	// address space maps it, so a thread of the system process would fault on the first fetch.
 	std::shared_ptr<thread> create_user_thread(vcpu& cpu, win_user_proc& proc,
 		const addr_t start_addr, const addr_t argument, const std::size_t stack_size,
-		const bool suspended)
+		const bool suspended, const bool publish = true)
 	{
 		const auto ntdll = proc.find_module(ntdll_name);
 
@@ -748,7 +759,7 @@ public:
 		if (suspended)
 			std::static_pointer_cast<win_thread>(t)->suspend();
 
-		t->start();
+		if (publish) t->start();
 
 		return t;
 	}

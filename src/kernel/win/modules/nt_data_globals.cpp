@@ -327,6 +327,8 @@ void modules::init_ntoskrnl_globals(win_kernel_state& state, proc_module& mod)
 	// global holds rather than null.
 	init_object_type(space, mod, "PsProcessType", u"Process");
 	init_object_type(space, mod, "PsThreadType", u"Thread");
+	if (const auto global = mod.find_symbol("PsProcessType")) state.ob_process_type = space.read_mem<addr_t>(*global);
+	if (const auto global = mod.find_symbol("PsThreadType")) state.ob_thread_type = space.read_mem<addr_t>(*global);
 	init_object_type(space, mod, "IoFileObjectType", u"File");
 	init_object_type(space, mod, "MmSectionObjectType", u"Section");
 	init_object_type(space, mod, "ExEventObjectType", u"Event");

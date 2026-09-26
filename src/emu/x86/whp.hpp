@@ -57,9 +57,8 @@ public:
 
 	// Whether the cpu is left to execute syscall or made to fault on it, decided by the
 	// ring it is about to run in. A vm entry is the one place that has to agree with the
-	// ring, and the ring only moves between entries: a thread switch restores cs with the
-	// cpu stopped, and nothing inside a run loop leaves ring 3 -- syscall no longer can,
-	// and apply_context only ever writes a usermode cs.
+	// ring. Thread switches restore cs with the cpu stopped, but nested callbacks can enter
+	// kernel mode while WHP is running, so syscall enable is resynchronized after dispatch.
 	void sync_syscall_enable(vcpu& cpu);
 
 protected:

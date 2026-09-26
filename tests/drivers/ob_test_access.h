@@ -1,0 +1,23 @@
+#pragma once
+/* Public SDK 10.0.28000.0 um/winnt.h rights absent from its kernel headers. */
+#ifndef PROCESS_TERMINATE
+#define PROCESS_TERMINATE 0x0001
+#endif
+#ifndef PROCESS_CREATE_THREAD
+#define PROCESS_CREATE_THREAD 0x0002
+#endif
+#ifndef PROCESS_VM_READ
+#define PROCESS_VM_READ 0x0010
+#endif
+#ifndef PROCESS_VM_WRITE
+#define PROCESS_VM_WRITE 0x0020
+#endif
+#ifndef PROCESS_QUERY_INFORMATION
+#define PROCESS_QUERY_INFORMATION 0x0400
+#endif
+#ifndef THREAD_QUERY_INFORMATION
+#define THREAD_QUERY_INFORMATION 0x0040
+#endif
+#ifndef THREAD_IMPERSONATE
+#define THREAD_IMPERSONATE 0x0100
+#endif

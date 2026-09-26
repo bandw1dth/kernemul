@@ -15,6 +15,8 @@ struct win_object
 	virtual ~win_object() = default;
 };
 
+struct process_identity_object final : win_object {};
+
 struct thread_object final : win_object
 {
 	std::shared_ptr<class thread> thread;

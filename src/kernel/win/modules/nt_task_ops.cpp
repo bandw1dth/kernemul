@@ -5,6 +5,7 @@
 #include "../status.hpp"
 #include "../string.hpp"
 #include "../thread.hpp"
+#include "../../thread_scheduler.hpp"
 #include "../types.hpp"
 #include "../../../emu/calling_conv.hpp"
 #include "../../../util/log.hpp"
@@ -204,7 +205,11 @@ void modules::register_ntoskrnl_task_ops(win_kernel_state& state, proc_module& m
 		const addr_t attribute_list) -> NTSTATUS
 	{
 		if (!thread_handle || !start_routine)
-			return STATUS_INVALID_PARAMETER;
+            return STATUS_INVALID_PARAMETER;
+        if (st->ob_notify.in_callback(cpu.id())) st->fail_ob_notify(cpu, "nested handle operations are unsupported");
+        if (desired_access & 0xf2000000u) return STATUS_NOT_SUPPORTED;
+        try { thread_handle.write(thread_handle.read()); }
+        catch (...) { return STATUS_ACCESS_VIOLATION; }
 
 		if (process_handle != 0 && process_handle != current_process_handle)
 		{
@@ -234,12 +239,13 @@ void modules::register_ntoskrnl_task_ops(win_kernel_state& state, proc_module& m
 			const auto stack = maximum_stack_size ? maximum_stack_size : stack_size;
 
 			t = emulator->create_user_thread(cpu, *caller, start_routine, argument,
-				static_cast<std::size_t>(stack), (create_flags & thread_create_suspended) != 0);
+				static_cast<std::size_t>(stack), (create_flags & thread_create_suspended) != 0, false);
 		}
 		else
 		{
 			const std::uint64_t args[] = { argument };
-			t = st->sys_proc->create_thread(cpu, start_routine, args);
+			t = st->sys_proc->create_suspended_thread(cpu, start_routine, args);
+            if (t && (create_flags & thread_create_suspended)) std::static_pointer_cast<win_thread>(t)->suspend();
 		}
 
 		if (!t)
@@ -251,29 +257,34 @@ void modules::register_ntoskrnl_task_ops(win_kernel_state& state, proc_module& m
 
 		const auto wt = std::static_pointer_cast<win_thread>(t);
 		const auto ethread = wt->ethread().address();
+        auto rollback = [&] { t->proc()->terminate_thread(t->id()); };
 
 		if (!ethread)
 		{
 			THREAD_LOG_ERR("NtCreateThreadEx: tid={} has no ETHREAD", t->id());
+			rollback();
 			return STATUS_NO_MEMORY;
 		}
 
-		const auto handle = st->sys_proc->handle_table().create_handle(ethread, desired_access);
-		thread_handle.write(handle);
+        try
+        {
+            // Child remains unstarted until all output and OB delivery succeeds.
+            write_thread_attributes(cpu, attribute_list, *wt);
+            const auto attributes = object_attributes ? object_attributes.field(&_OBJECT_ATTRIBUTES::Attributes).read() : 0;
+            const auto status = st->create_ob_handle(cpu, ethread, desired_access, attributes, thread_handle);
+            if (status != STATUS_SUCCESS) { rollback(); return status; }
+        }
+        catch (...)
+        {
+            rollback();
+            if (cpu.execution_failed() || (st->sys_proc->scheduler() && st->sys_proc->scheduler()->stopped())) throw;
+            return STATUS_ACCESS_VIOLATION;
+        }
+        t->start();
+        return STATUS_SUCCESS;
+    };
 
-		// What the caller asked to be told about the thread it just made: kernel32 reads the
-		// thread id it returns out of the client id it asks for here.
-		write_thread_attributes(cpu, attribute_list, *wt);
-
-		THREAD_LOG_INFO("NtCreateThreadEx(start=0x{:X}, argument=0x{:X}, flags=0x{:X}, "
-			"attributes=0x{:X}) -> tid={}, handle=0x{:X}{}",
-			start_routine, argument, create_flags, attribute_list, t->id(), handle,
-			(create_flags & thread_create_suspended) ? ", suspended" : "");
-
-		return STATUS_SUCCESS;
-	};
-
-	auto open_thread = [st](vcpu&, emu_object<std::uint64_t> thread_handle,
+	auto open_thread = [st](vcpu& cpu, emu_object<std::uint64_t> thread_handle,
 		const std::uint32_t desired_access,
 		[[maybe_unused]] emu_object<_OBJECT_ATTRIBUTES> object_attributes,
 		emu_object<_CLIENT_ID> client_id) -> NTSTATUS
@@ -281,7 +292,8 @@ void modules::register_ntoskrnl_task_ops(win_kernel_state& state, proc_module& m
 		if (!thread_handle)
 			return STATUS_INVALID_PARAMETER;
 
-		thread_handle.write(0);
+		if (st->ob_notify.in_callback(cpu.id())) st->fail_ob_notify(cpu, "nested handle operations are unsupported");
+		try { thread_handle.write(0); } catch (...) { return STATUS_ACCESS_VIOLATION; }
 
 		if (!client_id)
 		{
@@ -302,14 +314,8 @@ void modules::register_ntoskrnl_task_ops(win_kernel_state& state, proc_module& m
 			return STATUS_INVALID_CID;
 		}
 
-		st->objs.reference_object(ethread);
-		const auto handle = st->sys_proc->handle_table().create_handle(ethread, desired_access);
-
-		thread_handle.write(handle);
-
-		THREAD_LOG_INFO("NtOpenThread(tid={}) -> handle=0x{:X}", tid, handle);
-
-		return STATUS_SUCCESS;
+        const auto attributes = object_attributes ? object_attributes.field(&_OBJECT_ATTRIBUTES::Attributes).read() : 0;
+        return st->create_ob_handle(cpu, ethread, desired_access, attributes, thread_handle);
 	};
 
 	auto terminate_thread = [st](vcpu& cpu, const std::uint64_t thread_handle,

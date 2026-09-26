@@ -62,7 +62,7 @@ bool is_supported_object_type(addr_space& space, const proc_module& mod,
 	if (!object_type || !type)
 		return false;
 
-	for (const auto symbol : { "PsProcessType", "PsThreadType", "ExDesktopObjectType" })
+	for (const auto symbol : { "PsProcessType", "PsThreadType" })
 	{
 		const auto global = mod.find_symbol(symbol);
 		if (global && object_type == *global)
@@ -88,29 +88,33 @@ void modules::register_ntoskrnl_object_ops(win_kernel_state& state, proc_module&
 {
 	auto* sys_proc = state.sys_proc.get();
 
-	state.redirect(mod, "ObReferenceObjectByHandle",
-		[sys_proc, &objs = state.objs](vcpu& cpu,
-			std::uint64_t handle, [[maybe_unused]] std::uint32_t desired_access,
-			[[maybe_unused]] emu_object<void> object_type, [[maybe_unused]] std::uint8_t access_mode,
-			emu_object<std::uint64_t> object_out) -> NTSTATUS
-		{
-			THREAD_LOG_INFO("ObReferenceObjectByHandle(handle=0x{:X}, object_out=0x{:X})",
-				handle, object_out.address());
-
-			const auto entry = sys_proc->handle_table().lookup_handle(handle);
-			if (!entry)
-			{
-				THREAD_LOG_WARN("ObReferenceObjectByHandle: invalid handle 0x{:X}", handle);
-				return STATUS_INVALID_HANDLE;
-			}
-
-			objs.reference_object(entry->body_addr);
-
-			if (object_out)
-				object_out.write(entry->body_addr);
-
-			return STATUS_SUCCESS;
-		});
+    state.redirect(mod, "ObReferenceObjectByHandle",
+        [st = &state, sys_proc](vcpu&, std::uint64_t handle, std::uint32_t desired_access,
+            addr_t object_type, std::uint8_t access_mode, emu_object<addr_t> object_out,
+            emu_object<void> handle_information) -> NTSTATUS
+        {
+            const auto entry = sys_proc->handle_table().lookup_handle(handle);
+            if (!entry || (access_mode && (entry->attributes & 0x200u))) return STATUS_INVALID_HANDLE;
+            const auto actual = st->ob_object_type(entry->body_addr);
+            if (object_type && (actual || object_type == st->ob_process_type || object_type == st->ob_thread_type)
+                && object_type != actual) return STATUS_OBJECT_TYPE_MISMATCH;
+            if (access_mode && actual && (desired_access & ~entry->access)) return STATUS_ACCESS_DENIED;
+            if (access_mode && actual && (desired_access & 0xf2000000u)) return STATUS_NOT_SUPPORTED;
+            if (!object_out) return STATUS_INVALID_PARAMETER;
+            try
+            {
+                if (handle_information)
+                {
+                    struct information { std::uint32_t attributes, granted; };
+                    emu_object<information>(*handle_information.space(), handle_information.address())
+                        .write({entry->attributes, entry->access});
+                }
+                object_out.write(entry->body_addr);
+            }
+            catch (...) { return STATUS_ACCESS_VIOLATION; }
+            st->objs.reference_object(entry->body_addr);
+            return STATUS_SUCCESS;
+        });
 
 	state.redirect(mod, "ObfReferenceObject",
 		[&objs = state.objs](vcpu&, addr_t object) -> void
@@ -185,114 +189,57 @@ void modules::register_ntoskrnl_object_ops(win_kernel_state& state, proc_module&
 
 	state.redirect_ntzw(mod, "Close", close_fn);
 
-	// Records belong to this emulator's redirected handlers; callback delivery remains unsupported.
-	auto ob_callbacks = std::make_shared<win::callbacks::registry<addr_t,
-		win::callbacks::ob_registration>>(0x10000);
-	state.redirect(mod, "ObRegisterCallbacks",
-		[ob_callbacks, &mod](vcpu& cpu, emu_object<void> callback_registration,
-			emu_object<addr_t> registration_handle) -> NTSTATUS
-		{
-			if (!callback_registration || !registration_handle)
-				return STATUS_INVALID_PARAMETER;
-
-			win::callbacks::registry<addr_t,
-				win::callbacks::ob_registration>::insert_result inserted{
-					.status = win::callbacks::insert_status::identifier_exhausted,
-				};
-			std::string altitude_log;
-			std::uint16_t operation_count{};
-			try
-			{
-				auto& space = *cpu.curr_addr_space();
-				const auto reg = emu_object<ob_callback_registration_t>(space,
-					callback_registration.address()).read();
-
-				if (reg.version != ob_flt_registration_version || !reg.operation_count
-					|| !reg.operation_registration)
-					return STATUS_INVALID_PARAMETER;
-
-				const auto altitude = callback_altitude(space, reg.altitude);
-				if (!altitude)
-					return STATUS_INVALID_PARAMETER;
-				altitude_log = narrow_wstring(*altitude);
-				operation_count = reg.operation_count;
-
-				win::callbacks::ob_registration copied{
-					.version = reg.version,
-					.context = reg.registration_context,
-					.altitude = *altitude,
-				};
-				copied.operations.reserve(reg.operation_count);
-
-				constexpr auto valid_operations = ob_operation_handle_create
-					| ob_operation_handle_duplicate;
-				for (std::uint16_t i = 0; i < reg.operation_count; ++i)
-				{
-					const auto offset = static_cast<addr_t>(i)
-						* sizeof(ob_operation_registration_t);
-					if (reg.operation_registration > std::numeric_limits<addr_t>::max() - offset)
-						return STATUS_INVALID_PARAMETER;
-
-					const auto entry = emu_object<ob_operation_registration_t>(space,
-						reg.operation_registration + offset).read();
-					if (!entry.object_type || !entry.operations
-						|| (entry.operations & ~valid_operations)
-						|| (!entry.pre_operation && !entry.post_operation))
-						return STATUS_INVALID_PARAMETER;
-
-					const auto type = space.read_mem<addr_t>(entry.object_type);
-					if (!is_supported_object_type(space, mod, entry.object_type, type))
-						return STATUS_INVALID_PARAMETER;
-
-					copied.operations.push_back({
-						.object_type = entry.object_type,
-						.type = type,
-						.operations = entry.operations,
-						.pre_operation = entry.pre_operation,
-						.post_operation = entry.post_operation,
-					});
-				}
-
-				inserted = ob_callbacks->insert(std::move(copied),
-					[&registration_handle](const addr_t handle)
-					{
-						registration_handle.write(handle);
-					});
-			}
-			catch (const std::bad_alloc&)
-			{
-				return STATUS_INSUFFICIENT_RESOURCES;
-			}
-			catch (const std::exception&)
-			{
-				return STATUS_INVALID_PARAMETER;
-			}
-
-			switch (inserted.status)
-			{
-			case win::callbacks::insert_status::altitude_collision:
-				return status_flt_instance_altitude_collision;
-			case win::callbacks::insert_status::output_write_failed:
-				return STATUS_ACCESS_VIOLATION;
-			case win::callbacks::insert_status::identifier_exhausted:
-				return STATUS_INSUFFICIENT_RESOURCES;
-			case win::callbacks::insert_status::success:
-				THREAD_LOG_WARN("ObRegisterCallbacks(0x{:X}, altitude='{}', {} operation(s)) -> "
-					"0x{:X}: object callback delivery is unsupported",
-					callback_registration.address(), altitude_log, operation_count, inserted.id);
-				return STATUS_SUCCESS;
-			}
-			return STATUS_UNSUCCESSFUL;
-		});
-
-	state.redirect(mod, "ObUnRegisterCallbacks",
-		[ob_callbacks](vcpu&, const addr_t registration_handle)
-		{
-			const bool removed = ob_callbacks->unregister(registration_handle);
-			THREAD_LOG_INFO("ObUnRegisterCallbacks(0x{:X}) -> {}{}",
-				registration_handle, removed ? "removed" : "unknown handle",
-				removed ? "; object callback delivery is unsupported" : "");
-		});
+    state.redirect(mod, "ObRegisterCallbacks",
+        [st = &state, &mod](vcpu& cpu, emu_object<void> callback_registration,
+            emu_object<addr_t> registration_handle) -> NTSTATUS
+        {
+            if (!callback_registration || !registration_handle) return STATUS_INVALID_PARAMETER;
+            if (cpu.in_dpc || !st->emulator() || st->emulator()->irql(cpu) > apc_level)
+                return STATUS_INVALID_PARAMETER;
+            try
+            {
+                auto& space = *cpu.curr_addr_space();
+                const auto reg = emu_object<ob_callback_registration_t>(space, callback_registration.address()).read();
+                if (reg.version != ob_flt_registration_version || !reg.operation_count || !reg.operation_registration)
+                    return STATUS_INVALID_PARAMETER;
+                const auto altitude = callback_altitude(space, reg.altitude);
+                if (!altitude) return STATUS_INVALID_PARAMETER;
+                win::callbacks::ob_registration copied{reg.version, reg.registration_context, *altitude, {}};
+                for (std::uint16_t i = 0; i < reg.operation_count; ++i)
+                {
+                    const auto offset = static_cast<addr_t>(i) * sizeof(ob_operation_registration_t);
+                    if (reg.operation_registration > std::numeric_limits<addr_t>::max() - offset)
+                        return STATUS_INVALID_PARAMETER;
+                    const auto entry = space.read_mem<ob_operation_registration_t>(reg.operation_registration + offset);
+                    if (const auto desktop = mod.find_symbol("ExDesktopObjectType"); desktop && entry.object_type == *desktop)
+                        return STATUS_NOT_SUPPORTED;
+                    if (!entry.object_type || !entry.operations || (entry.operations & ~3u)
+                        || (!entry.pre_operation && !entry.post_operation)) return STATUS_INVALID_PARAMETER;
+                    const auto type = space.read_mem<addr_t>(entry.object_type);
+                    if (!is_supported_object_type(space, mod, entry.object_type, type)) return STATUS_INVALID_PARAMETER;
+                    copied.operations.push_back({entry.object_type, type, entry.operations, entry.pre_operation, entry.post_operation});
+                }
+                const auto result = st->ob_notify.add(std::move(copied), [&](addr_t cookie) { registration_handle.write(cookie); });
+                using result_t = win::ob_notify_service::add_status;
+                switch (result)
+                {
+                case result_t::success: return STATUS_SUCCESS;
+                case result_t::collision: return status_flt_instance_altitude_collision;
+                case result_t::output_failed: return STATUS_ACCESS_VIOLATION;
+                case result_t::exhausted: return STATUS_INSUFFICIENT_RESOURCES;
+                default: return STATUS_INVALID_PARAMETER;
+                }
+            }
+            catch (const std::bad_alloc&) { return STATUS_INSUFFICIENT_RESOURCES; }
+            catch (...) { return STATUS_ACCESS_VIOLATION; }
+        });
+    state.redirect(mod, "ObUnRegisterCallbacks",
+        [st = &state](vcpu& cpu, addr_t cookie) {
+            if (st->in_lifecycle_callback(cpu.id())) st->fail_ob_notify(cpu, "unregister inside lifecycle callback is unsupported");
+            if (!st->emulator() || cpu.in_dpc || st->emulator()->irql(cpu) > apc_level)
+                st->fail_ob_notify(cpu, "unregister requires IRQL <= APC_LEVEL");
+            st->ob_notify.remove(cookie, false);
+        });
 
 	// Nothing here builds a type index table, so the kind comes from the host object instead.
 	state.redirect(mod, "ObGetObjectType",
@@ -300,7 +247,9 @@ void modules::register_ntoskrnl_object_ops(win_kernel_state& state, proc_module&
 		{
 			std::string_view symbol;
 
-			if (st->objs.get_object<file_host>(object))
+			if (st->objs.get_object<process_identity_object>(object))
+				symbol = "PsProcessType";
+			else if (st->objs.get_object<file_host>(object))
 				symbol = "IoFileObjectType";
 			else if (st->objs.get_object<section_host>(object))
 				symbol = "MmSectionObjectType";
@@ -329,27 +278,19 @@ void modules::register_ntoskrnl_object_ops(win_kernel_state& state, proc_module&
 			return type;
 		});
 
-	state.redirect(mod, "ObOpenObjectByPointer",
-		[st = &state](vcpu&, const addr_t object, const std::uint32_t handle_attributes,
-			const addr_t passed_access_state, const std::uint32_t desired_access,
-			const addr_t object_type, const std::uint8_t access_mode,
-			emu_object<std::uint64_t> handle) -> NTSTATUS
-		{
-			if (!handle)
-				return STATUS_INVALID_PARAMETER;
-
-			st->objs.reference_object(object);
-			const auto value = st->sys_proc->handle_table().create_handle(object, desired_access);
-
-			handle.write(value);
-
-			THREAD_LOG_INFO("ObOpenObjectByPointer(0x{:X}, attributes=0x{:X}, access_state=0x{:X}, "
-				"access=0x{:X}, type=0x{:X}, mode={}) -> handle=0x{:X}",
-				object, handle_attributes, passed_access_state, desired_access, object_type,
-				access_mode, value);
-
-			return STATUS_SUCCESS;
-		});
+    state.redirect(mod, "ObOpenObjectByPointer",
+        [st = &state](vcpu& cpu, addr_t object, std::uint32_t attributes,
+            addr_t passed_access_state, std::uint32_t access, addr_t object_type,
+            std::uint8_t access_mode, emu_object<std::uint64_t> handle) -> NTSTATUS
+        {
+            if (st->ob_notify.in_callback(cpu.id())) st->fail_ob_notify(cpu, "nested handle operations are unsupported");
+            const auto actual = st->ob_object_type(object);
+            if (object_type && (actual || object_type == st->ob_process_type || object_type == st->ob_thread_type)
+                && object_type != actual) return STATUS_OBJECT_TYPE_MISMATCH;
+            if (actual && passed_access_state) return STATUS_NOT_SUPPORTED;
+            if (actual && access_mode && (attributes & 0x200u)) return STATUS_INVALID_PARAMETER;
+            return st->create_ob_handle(cpu, object, access, attributes, handle);
+        });
 
 	// There is one handle table, hanging off the system process, and every process here shares it.
 	state.redirect(mod, "ObReferenceProcessHandleTable",

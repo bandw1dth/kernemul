@@ -38,6 +38,8 @@ It does not install a Windows driver. Run fixtures from PowerShell 7 (`pwsh`) wi
 .\tests\scripts\run-conformance.ps1 -Driver image_notify_boundaries
 .\tests\scripts\run-conformance.ps1 -Driver registry_notify_conformance
 .\tests\scripts\run-conformance.ps1 -Driver registry_notify_boundaries
+.\tests\scripts\run-conformance.ps1 -Driver ob_notify_conformance
+.\tests\scripts\run-conformance.ps1 -Driver ob_notify_boundaries
 .\tests\scripts\run-model-tests.ps1
 .\tests\scripts\run-negative-tests.ps1
 ```
@@ -62,7 +64,9 @@ versions. Do not load the unsigned fixture into the host as part of this workflo
 1. Extend lifecycle delivery to process creation, kernel driver loads, Ex thread
    modes, and target-context remote termination. Guest image-section mappings now
    deliver notifications; see [image mapping](image-mapping.md) for scope and tests.
-2. Object-handle pre/post delivery and remaining registry operations. Registry
+2. Extend object-handle coverage and remaining registry operations. Process/thread
+   handle operations now deliver access-filtering pre/post callbacks; see
+   [object handle notifications](object-handle-notifications.md). Registry
    value set/query/delete now have a filtering pipeline; see
    [registry notifications](registry-notifications.md) for scope and contracts.
 3. Coherent process-local handles and guest EPROCESS.ObjectTable representation.
@@ -90,7 +94,8 @@ separate multiprocessor validation.
 Executive callback delivery rechecks active registration state before invoking each
 record. Unregister prevents future dispatch, but does not drain an already in-flight
 callback on another vCPU. Full callback rundown needs scheduler-aware completion.
-Object registration retention does not imply operation delivery. Registry value
+Process/thread handle operations deliver matching OB callbacks, with the scope and
+access-enforcement limits described in the object handle document. Registry value
 operations now deliver pre/post callbacks; other registry paths remain deferred.
 Registrations copy caller-owned data, enforce altitude collisions, and invalidate
 exact handles/cookies on removal. Executive callbacks have the Windows-owned

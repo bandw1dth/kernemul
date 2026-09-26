@@ -4,7 +4,7 @@
 win_handle_table::win_handle_table(win_obj_manager& objs)
 	:	objs_(objs) {}
 
-win_handle_table::handle_t win_handle_table::create_handle(addr_t body_addr, access_t access)
+win_handle_table::handle_t win_handle_table::create_handle(addr_t body_addr, access_t access, std::uint32_t attributes)
 {
 	if (!objs_.has_object(body_addr))
 	{
@@ -16,7 +16,7 @@ win_handle_table::handle_t win_handle_table::create_handle(addr_t body_addr, acc
 
 	{
 		std::unique_lock lock(mtx_);
-		handles_[h] = { body_addr, access };
+		handles_[h] = { body_addr, access, attributes };
 	}
 
 	objs_.increment_handle_count(body_addr);

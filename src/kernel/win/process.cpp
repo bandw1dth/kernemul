@@ -3,6 +3,211 @@
 #include "win_kernel.hpp"
 #include "../thread_scheduler.hpp"
 #include "../../util/log.hpp"
+#if defined(KERNEMUL_ARCH_ARM64)
+#include "../../emu/arm64/arch.hpp"
+#endif
+
+namespace
+{
+// WDK 64-bit OB layouts (x64 and ARM64).
+struct ob_pre_info
+{
+    std::uint32_t operation, flags;
+    addr_t object, type, context, parameters;
+    bool operator==(const ob_pre_info&) const = default;
+};
+struct ob_post_info
+{
+    std::uint32_t operation, flags;
+    addr_t object, type, context;
+    std::uint32_t status, padding = 0;
+    addr_t parameters;
+    bool operator==(const ob_post_info&) const = default;
+};
+struct ob_parameters
+{
+    std::uint32_t desired, original;
+    addr_t source = 0, target = 0;
+    bool operator==(const ob_parameters&) const = default;
+};
+static_assert(sizeof(ob_pre_info) == 40 && sizeof(ob_post_info) == 48 && sizeof(ob_parameters) == 24);
+}
+
+addr_t win_kernel_state::ob_object_type(const addr_t object)
+{
+    if (objs.get_object<thread_object>(object)) return ob_thread_type;
+    if (objs.get_object<process_identity_object>(object)) return ob_process_type;
+    return 0;
+}
+
+[[noreturn]] void win_kernel_state::fail_ob_notify(vcpu& cpu, const char* reason)
+{
+    THREAD_LOG_ERR("ob notify: {}", reason);
+    if (const auto scheduler = sys_proc->scheduler()) scheduler->stop();
+    cpu.stop();
+    throw std::runtime_error(reason);
+}
+
+void win_kernel_state::call_ob_notify(vcpu& cpu, addr_t routine, addr_t context,
+    addr_t information, bool pre, const std::function<void()>& validate)
+{
+    const auto caller = std::dynamic_pointer_cast<win_thread>(cpu.thread());
+    auto* const emu = emulator();
+    const auto scheduler = sys_proc->scheduler();
+    if (!caller || !caller->ethread() || !emu || cpu.in_dpc || emu->irql(cpu) != passive_level)
+        fail_ob_notify(cpu, "callback requires a thread at PASSIVE_LEVEL");
+    const auto irql = emu->irql(cpu);
+    const auto kernel = caller->kernel_apc_disable().read();
+    const auto special = caller->special_apc_disable().read();
+    const auto sleep = caller->sleep_until();
+    // Snapshot before raising privilege: guest_caller saves only the state at
+    // its own entry. Thread origin cannot tell whether a user thread is already
+    // executing a driver callback. Preserve the actual selectors/PSTATE and PCR.
+    const auto thread_regs = cpu.arch()->regs();
+    std::vector<reg_t> regs(thread_regs.begin(), thread_regs.end());
+#if defined(KERNEMUL_ARCH_ARM64)
+    // set_pcr also updates this per-CPU register, outside the thread snapshot.
+    regs.push_back(arm64::tpidr_el1);
+#endif
+    std::vector<reg_val> saved(regs.size());
+    for (std::size_t i = 0; i < regs.size(); ++i)
+        cpu.reg_read(regs[i], &saved[i], cpu.arch()->reg_size(regs[i]));
+    auto restore = [&] {
+        emu->set_irql(cpu, irql);
+        caller->kernel_apc_disable().write(kernel);
+        caller->special_apc_disable().write(special);
+        for (std::size_t i = 0; i < regs.size(); ++i)
+            cpu.reg_write(regs[i], &saved[i], cpu.arch()->reg_size(regs[i]));
+    };
+    const std::uint64_t args[] = {context, information};
+    ++win::ob_callback_depth;
+    try
+    {
+        // A syscall handler still has the caller's ring-3 stack and PCR. Use a
+        // supervisor stack for this delivery and return the exact incoming state.
+        const pool_block stack(pool, process::default_stack_size, pool_tag("ObSt"));
+        if (!stack.addr()) fail_ob_notify(cpu, "callback stack allocation failed");
+        emu->set_kernel_mode(cpu, true);
+        const auto pcpu = per_cpu(cpu.id());
+        if (!pcpu) fail_ob_notify(cpu, "callback requires a per-CPU kernel context");
+        emu->set_pcr(cpu, pcpu->address());
+        cpu.set_sp(stack.addr() + process::default_stack_size - process::stack_reserve);
+        // Establish documented OB delivery context, then restore the caller's.
+        caller->kernel_apc_disable().write(-1);
+        caller->special_apc_disable().write(0);
+        const auto result = static_cast<std::uint32_t>(calls.call(cpu, routine, args, 0, [&] {
+            if (caller->suspend_count() || caller->is_waiting() || caller->sleep_until() != sleep)
+                fail_ob_notify(cpu, "callback cannot block or suspend");
+            return cpu.dpc_failed || cpu.execution_failed() || caller->is_finished()
+                || (scheduler && scheduler->stopped());
+        }));
+        if (cpu.dpc_failed || cpu.execution_failed() || caller->is_finished()
+            || (scheduler && scheduler->stopped())) fail_ob_notify(cpu, "callback execution failed");
+        if (caller->suspend_count() || caller->is_waiting() || caller->sleep_until() != sleep)
+            fail_ob_notify(cpu, "callback cannot block or suspend");
+        if (emu->irql(cpu) != passive_level || caller->kernel_apc_disable().read() != -1
+            || caller->special_apc_disable().read() != 0)
+            fail_ob_notify(cpu, "callback returned with unbalanced IRQL/APC context");
+        if (pre && result != 0) fail_ob_notify(cpu, "pre callback returned invalid OB_PREOP_CALLBACK_STATUS");
+        validate();
+        restore();
+        --win::ob_callback_depth;
+    }
+    catch (...)
+    {
+        --win::ob_callback_depth;
+        if (scheduler) scheduler->stop();
+        cpu.stop();
+        restore();
+        THREAD_LOG_ERR("ob notify: callback failed before returning; stopped");
+        THREAD_LOG_INFO("ob notify: restored irql={}, kernel_apc_disable={}, special_apc_disable={}",
+            emu->irql(cpu), caller->kernel_apc_disable().read(), caller->special_apc_disable().read());
+        throw;
+    }
+}
+
+NTSTATUS win_kernel_state::create_ob_handle(vcpu& cpu, addr_t object, std::uint32_t access,
+    std::uint32_t attributes, emu_object<std::uint64_t> output,
+    std::uint32_t operation, std::uint32_t access_ceiling)
+{
+    if (ob_notify.in_callback(cpu.id())) fail_ob_notify(cpu, "nested handle operations are unsupported");
+    if (!output) return STATUS_INVALID_PARAMETER;
+    auto& space = *cpu.curr_addr_space();
+    // Host-copy MMU supports mapping validation, not guest permission probing.
+    if (output.address() > std::numeric_limits<addr_t>::max() - 7) return STATUS_ACCESS_VIOLATION;
+    for (addr_t i = 0; i < 8; ++i)
+        if (!space.mmu_->virt_to_phys(space, output.address() + i)) return STATUS_ACCESS_VIOLATION;
+    const auto type = ob_object_type(object);
+    if (type && (access & 0xf2000000u)) return STATUS_NOT_SUPPORTED; // generic / MAXIMUM_ALLOWED
+    if (type && (access & ~access_ceiling)) return STATUS_ACCESS_DENIED;
+    const auto original = access;
+    const auto modifiable = type == ob_process_type ? win::ob_process_modifiable : win::ob_thread_modifiable;
+    auto& handles = sys_proc->handle_table();
+    std::uint64_t handle = 0;
+    auto body = [&]() -> NTSTATUS {
+        try
+        {
+            handle = handles.create_handle(object, access, attributes);
+            if (!handle) return STATUS_INSUFFICIENT_RESOURCES;
+            output.write(handle);
+            return STATUS_SUCCESS;
+        }
+        catch (...) { if (handle) handles.close_handle(handle); handle = 0; return STATUS_ACCESS_VIOLATION; }
+    };
+    if (!type) return body();
+    // Count an object reference across pre/body/post. Object manager deliberately
+    // does not reclaim guest bodies; this is not a full Windows lifetime model.
+    struct pin
+    {
+        win_obj_manager& objs; addr_t object;
+        pin(win_obj_manager& o, addr_t a) : objs(o), object(a) { objs.reference_object(object); }
+        ~pin() { objs.dereference_object(object); }
+    } reference(objs, object);
+    const auto caller = cpu.thread() ? std::dynamic_pointer_cast<windows_process>(cpu.thread()->proc()) : nullptr;
+    const auto process = caller ? caller->eprocess().address() : 0;
+    if (operation == 2 && !process) return STATUS_NOT_SUPPORTED;
+    struct frame { std::unique_ptr<pool_block> scratch; addr_t context = 0; };
+    std::vector<frame> frames;
+    try
+    {
+        return ob_notify.dispatch(cpu.id(), type, operation,
+            [&](const auto& reg, const auto& op, std::size_t index) {
+                auto scratch = std::make_unique<pool_block>(pool, 80, pool_tag("ObNt"));
+                if (!scratch->addr()) fail_ob_notify(cpu, "scratch allocation failed");
+                frames.push_back({std::move(scratch)});
+                const auto info = frames[index].scratch->addr(), params = info + 48;
+                const ob_pre_info expected{operation, (attributes & 0x200u) ? 1u : 0u, object, type, 0, params};
+                const ob_parameters expected_params{access, original, operation == 2 ? process : 0, operation == 2 ? process : 0};
+                space.write_mem(info, expected);
+                space.write_mem(params, expected_params);
+                if (op.pre_operation) call_ob_notify(cpu, op.pre_operation, reg->value.context, info, true, [&] {
+                    auto returned = space.read_mem<ob_pre_info>(info);
+                    auto returned_params = space.read_mem<ob_parameters>(params);
+                    frames[index].context = returned.context;
+                    returned.context = 0;
+                    const auto requested = returned_params.desired;
+                    returned_params.desired = expected_params.desired;
+                    if (returned != expected || returned_params != expected_params)
+                        fail_ob_notify(cpu, "pre callback rewrote IN metadata");
+                    access = win::ob_reduce_access(access, requested, modifiable);
+                });
+            }, body,
+            [&](const auto& reg, const auto& op, std::size_t index, std::uint32_t status) {
+                if (!op.post_operation) return;
+                const auto info = frames[index].scratch->addr(), params = info + 48;
+                const ob_post_info expected{operation, (attributes & 0x200u) ? 1u : 0u,
+                    object, type, frames[index].context, status, 0, (status & 0x80000000u) ? 0 : params};
+                space.write_mem(info, expected);
+                space.write_mem(params, access);
+                call_ob_notify(cpu, op.post_operation, reg->value.context, info, false, [&] {
+                    if (space.read_mem<ob_post_info>(info) != expected
+                        || (expected.parameters && space.read_mem<std::uint32_t>(params) != access))
+                        fail_ob_notify(cpu, "post callback rewrote IN metadata");
+                });
+            });
+    }
+    catch (...) { if (handle) handles.close_handle(handle); throw; }
+}
 
 NTSTATUS win_kernel_state::call_registry_notify(vcpu& cpu,
 	const win::registry_notify_service::record& registration,

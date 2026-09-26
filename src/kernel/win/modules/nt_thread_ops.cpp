@@ -1,5 +1,6 @@
 #include "nt_thread_ops.hpp"
 #include "../thread.hpp"
+#include "../../thread_scheduler.hpp"
 #include "../win_kernel.hpp"
 #include "../status.hpp"
 #include "../types.hpp"
@@ -35,20 +36,23 @@ void modules::register_ntoskrnl_thread_ops(win_kernel_state& state, proc_module&
 
 	state.redirect(mod, "PsCreateSystemThread",
 		[st, sys_proc](vcpu& cpu, emu_object<std::uint64_t> thread_handle_out,
-			[[maybe_unused]] std::uint32_t desired_access,
-			[[maybe_unused]] emu_object<void> object_attributes, [[maybe_unused]] std::uint64_t process_handle,
+			std::uint32_t desired_access,
+			emu_object<_OBJECT_ATTRIBUTES> object_attributes, std::uint64_t process_handle,
 			emu_object<CLIENT_ID> client_id_out, addr_t start_routine, addr_t start_context) -> NTSTATUS
 		{
 			THREAD_LOG_INFO("PsCreateSystemThread(handle_out=0x{:X}, start=0x{:X}, ctx=0x{:X})",
 				thread_handle_out.address(), start_routine, start_context);
 
 			if (!thread_handle_out || !start_routine) return STATUS_INVALID_PARAMETER;
+            if (st->ob_notify.in_callback(cpu.id())) st->fail_ob_notify(cpu, "nested handle operations are unsupported");
+            if (process_handle && process_handle != static_cast<std::uint64_t>(-1)) return STATUS_NOT_SUPPORTED;
+            if (desired_access & 0xf2000000u) return STATUS_NOT_SUPPORTED;
 			// Validate both complete output ranges before allocating a child. Guest writes
 			// can still fault later; rollback below keeps that child off the runnable queue.
 			try
 			{
-				static_cast<void>(thread_handle_out.read());
-				if (client_id_out) static_cast<void>(client_id_out.read());
+				thread_handle_out.write(thread_handle_out.read());
+				if (client_id_out) client_id_out.write(client_id_out.read());
 			}
 			catch (...) { return STATUS_ACCESS_VIOLATION; }
 
@@ -68,17 +72,21 @@ void modules::register_ntoskrnl_thread_ops(win_kernel_state& state, proc_module&
 					return STATUS_NO_MEMORY;
 				}
 				cpu.emu()->call_conv()->set_arg(cpu, *t, 0, start_context);
-				handle = sys_proc->handle_table().create_handle(t->ethread().address(), THREAD_ALL_ACCESS);
-				if (!handle)
+				if (client_id_out) client_id_out.write(t->client_id().read());
+                const auto attributes = object_attributes ? object_attributes.field(&_OBJECT_ATTRIBUTES::Attributes).read() : 0;
+                const auto status = st->create_ob_handle(cpu, t->ethread().address(), desired_access,
+                    attributes, thread_handle_out);
+                if (status != STATUS_SUCCESS) { rollback(); return status; }
+                handle = thread_handle_out.read();
+                if (!handle)
 				{
 					rollback();
 					return STATUS_NO_MEMORY;
 				}
-				if (client_id_out) client_id_out.write(t->client_id().read());
-				thread_handle_out.write(handle);
+
 			}
 			catch (const std::bad_alloc&) { rollback(); return STATUS_INSUFFICIENT_RESOURCES; }
-			catch (...) { rollback(); return STATUS_ACCESS_VIOLATION; }
+			catch (...) { rollback(); if (cpu.execution_failed() || (sys_proc->scheduler() && sys_proc->scheduler()->stopped())) throw; return STATUS_ACCESS_VIOLATION; }
 
 			try
 			{

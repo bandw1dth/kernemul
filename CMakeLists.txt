@@ -286,6 +286,7 @@ set(kernemul_SOURCES
 	"src/kernel/win/modules/tdi.hpp"
 	"src/kernel/win/modules/win32k.cpp"
 	"src/kernel/win/modules/win32k.hpp"
+	"src/kernel/win/ob_notify.hpp"
 	"src/kernel/win/objects.hpp"
 	"src/kernel/win/per_cpu.hpp"
 	"src/kernel/win/pool.cpp"
