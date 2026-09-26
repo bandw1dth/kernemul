@@ -1,6 +1,7 @@
 #include "nt_misc_ops.hpp"
 #include "../dispatcher.hpp"
 #include "../win_kernel.hpp"
+#include "../firmware_query.hpp"
 #include "../driver.hpp"
 #include "../pool.hpp"
 #include "../status.hpp"
@@ -1260,21 +1261,24 @@ void modules::register_ntoskrnl_misc_ops(win_kernel_state& state, proc_module& m
 			return STATUS_INVALID_HANDLE;
 		});
 
-	// No UEFI variable store, as ExGetFirmwareEnvironmentVariable also reports.
-	state.redirect_ntzw(mod, "QuerySystemEnvironmentValueEx",
-		[](vcpu&, emu_object<_UNICODE_STRING> variable_name, emu_object<void> vendor_guid,
-			[[maybe_unused]] const addr_t value, emu_object<std::uint32_t> value_length,
-			[[maybe_unused]] emu_object<std::uint32_t> attributes) -> NTSTATUS
+	state.redirect(mod, "NtQuerySystemEnvironmentValueEx",
+		[st](vcpu& cpu, emu_object<_UNICODE_STRING> name, emu_object<void> vendor,
+			addr_t value, emu_object<std::uint32_t> length, emu_object<std::uint32_t> attributes) -> NTSTATUS
 		{
-			if (value_length)
-				value_length.write(0);
-
-			THREAD_LOG_WARN("NtQuerySystemEnvironmentValueEx('{}', guid=0x{:X}): no uefi "
-				"firmware to read from",
-				narrow_wstring(win::read_unicode_string(variable_name)), vendor_guid.address());
-
-			return STATUS_NOT_IMPLEMENTED;
+			return win::firmware::query(*st, cpu, win::firmware::query_entry::nt,
+				name.address(), vendor.address(), value, length.address(), attributes.address());
 		});
+	// Only a distinct kernel Zw entry bypasses PreviousMode; actual user CS
+	// remains UserMode, including when native Nt/Zw exports alias one another.
+	if (const auto symbol = mod.find_symbol("ZwQuerySystemEnvironmentValueEx");
+		symbol && symbol != mod.find_symbol("NtQuerySystemEnvironmentValueEx"))
+		state.redirect(mod, "ZwQuerySystemEnvironmentValueEx",
+			[st](vcpu& cpu, emu_object<_UNICODE_STRING> name, emu_object<void> vendor,
+				addr_t value, emu_object<std::uint32_t> length, emu_object<std::uint32_t> attributes) -> NTSTATUS
+			{
+				return win::firmware::query(*st, cpu, win::firmware::query_entry::zw,
+					name.address(), vendor.address(), value, length.address(), attributes.address());
+			});
 
 	state.redirect_ntzw(mod, "QueryLicenseValue",
 		[](vcpu&, emu_object<_UNICODE_STRING> value_name, emu_object<std::uint32_t> type,

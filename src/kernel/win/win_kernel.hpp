@@ -9,6 +9,7 @@
 #include "modules/ntoskrnl.hpp"
 #include "boot_seed.hpp"
 #include "registry.hpp"
+#include "firmware.hpp"
 #include "registry_notify.hpp"
 #include "ob_notify.hpp"
 #include "filesystem.hpp"
@@ -49,6 +50,7 @@ struct win_kernel_state : kernel_state
 	win_obj_manager objs;
 	win_pool pool;
 	win_registry reg;
+	const win::firmware::store firmware = win::firmware::synthetic_uefi();
 	win_filesystem fs;
 	std::shared_ptr<win_kernel_proc> sys_proc;
 	loaded_module_list_t loaded_module_list;

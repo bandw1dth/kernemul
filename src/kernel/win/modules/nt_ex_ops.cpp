@@ -1,5 +1,6 @@
 #include "nt_ex_ops.hpp"
 #include "../win_kernel.hpp"
+#include "../firmware_query.hpp"
 #include "../status.hpp"
 #include "../string.hpp"
 #include "../types.hpp"
@@ -69,20 +70,11 @@ void modules::register_ntoskrnl_ex_ops(win_kernel_state& state, proc_module& mod
 		cpu.stop();
 	});
 
-	// Nothing here is UEFI and no variable store exists, so this is what such a machine gives.
 	state.redirect(mod, "ExGetFirmwareEnvironmentVariable",
-		[](vcpu&, emu_object<_UNICODE_STRING> variable_name, emu_object<void> vendor_guid,
-			[[maybe_unused]] const addr_t value, emu_object<std::uint32_t> value_length,
-			[[maybe_unused]] emu_object<std::uint32_t> attributes) -> NTSTATUS
+		[st](vcpu& cpu, emu_object<_UNICODE_STRING> name, emu_object<void> vendor,
+			addr_t value, emu_object<std::uint32_t> length, emu_object<std::uint32_t> attributes) -> NTSTATUS
 		{
-			const auto name = narrow_wstring(win::read_unicode_string(variable_name));
-
-			THREAD_LOG_WARN("ExGetFirmwareEnvironmentVariable('{}', guid=0x{:X}): no uefi "
-				"firmware to read from", name, vendor_guid.address());
-
-			if (value_length)
-				value_length.write(0);
-
-			return STATUS_NOT_IMPLEMENTED;
+			return win::firmware::query(*st, cpu, win::firmware::query_entry::ex,
+				name.address(), vendor.address(), value, length.address(), attributes.address());
 		});
 }

@@ -16,6 +16,14 @@ struct process_memory_copy
 		return user ? &user->mem() : nullptr;
 	}
 
+	// Keep validation and a staged transfer under the same effective process's
+	// VM metadata lock without exposing the allocator's mutex to API adapters.
+	static std::unique_lock<std::mutex> lock_memory(const std::shared_ptr<windows_process>& proc)
+	{
+		auto* mem = memory(proc);
+		return mem ? std::unique_lock<std::mutex>(mem->mtx_) : std::unique_lock<std::mutex>{};
+	}
+
 	static bool valid_range(addr_t address, std::uint64_t size, bool user)
 	{
 		if (!size) return true;
