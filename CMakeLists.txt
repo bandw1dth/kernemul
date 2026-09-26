@@ -295,6 +295,7 @@ set(kernemul_SOURCES
 	"src/kernel/win/process_params.hpp"
 	"src/kernel/win/registry.cpp"
 	"src/kernel/win/registry.hpp"
+	"src/kernel/win/registry_notify.hpp"
 	"src/kernel/win/rundown.hpp"
 	"src/kernel/win/section_image.hpp"
 	"src/kernel/win/section_views.hpp"

@@ -22,7 +22,115 @@ struct registry_key_host final : win_object
 {
 	std::shared_ptr<win_registry_key> key;
 	std::string path;
+	addr_t body = 0;
 };
+
+// WDK 64-bit CM layouts, shared by the x64 and ARM64 profiles.
+struct reg_set_value_info
+{
+	std::uint64_t object, value_name;
+	std::uint32_t title_index, type;
+	std::uint64_t data;
+	std::uint32_t data_size, padding = 0;
+	std::uint64_t call_context = 0, object_context = 0, reserved = 0;
+	bool operator==(const reg_set_value_info&) const = default;
+};
+struct reg_query_value_info
+{
+	std::uint64_t object, value_name;
+	std::uint32_t info_class, padding = 0;
+	std::uint64_t information;
+	std::uint32_t length, padding2 = 0;
+	std::uint64_t result_length, call_context = 0, object_context = 0, reserved = 0;
+	bool operator==(const reg_query_value_info&) const = default;
+};
+struct reg_delete_value_info
+{
+	std::uint64_t object, value_name, call_context = 0, object_context = 0, reserved = 0;
+	bool operator==(const reg_delete_value_info&) const = default;
+};
+struct reg_post_info
+{
+	std::uint64_t object;
+	std::uint32_t status, padding = 0;
+	std::uint64_t pre_information;
+	std::uint32_t return_status, padding2 = 0;
+	std::uint64_t call_context, object_context = 0, reserved = 0;
+};
+static_assert(sizeof(reg_set_value_info) == 64 && offsetof(reg_set_value_info, call_context) == 40);
+static_assert(sizeof(reg_query_value_info) == 72 && offsetof(reg_query_value_info, call_context) == 48);
+static_assert(sizeof(reg_delete_value_info) == 40);
+static_assert(sizeof(reg_post_info) == 56 && offsetof(reg_post_info, call_context) == 32);
+
+// Mapping validation only: the emulator's MMU host-copy interface does not expose
+// guest access-permission probing. Check every page and overflow before copying.
+bool registry_buffer(addr_space& space, addr_t address, std::size_t size)
+{
+	if (!size) return true;
+	if (!address || size - 1 > std::numeric_limits<addr_t>::max() - address) return false;
+	const auto last = address + size - 1;
+	const auto page = space.mmu_->page_size();
+	for (;;)
+	{
+		if (!space.mmu_->virt_to_phys(space, address)) return false;
+		if (last - address < page - address % page) return true;
+		address += page - address % page;
+	}
+}
+
+NTSTATUS capture_value_name(addr_space& space, emu_object<_UNICODE_STRING> input,
+	std::u16string& name)
+{
+	if (!registry_buffer(space, input.address(), sizeof(_UNICODE_STRING))) return STATUS_ACCESS_VIOLATION;
+	const auto us = input.read();
+	if (us.Length % sizeof(char16_t) || us.MaximumLength < us.Length) return STATUS_INVALID_PARAMETER;
+	if (!registry_buffer(space, guest_va(us.Buffer), us.Length)) return STATUS_ACCESS_VIOLATION;
+	name.resize(us.Length / sizeof(char16_t));
+	if (us.Length) space.read_mem(guest_va(us.Buffer), name.data(), us.Length);
+	return STATUS_SUCCESS;
+}
+
+template <typename Info, typename Body>
+NTSTATUS registry_value_operation(win_kernel_state& state, vcpu& cpu,
+	const std::shared_ptr<registry_key_host>& host, const Info& original,
+	std::uint32_t pre_class, std::uint32_t post_class, Body&& body)
+{
+	// Keep both representations alive even if a pre callback closes the handle.
+	struct key_reference
+	{
+		win_obj_manager& manager;
+		addr_t object;
+		key_reference(win_obj_manager& m, addr_t o) : manager(m), object(o) { manager.reference_object(object); }
+		~key_reference() { manager.dereference_object(object); }
+	} reference(state.objs, host->body);
+	auto& space = *cpu.curr_addr_space();
+	struct frame { std::unique_ptr<pool_block> scratch; std::uint64_t context = 0; };
+	std::vector<frame> frames;
+	return state.registry_notify.dispatch(cpu.id(),
+		[&](const auto& registration, std::size_t index) -> NTSTATUS {
+			auto scratch = std::make_unique<pool_block>(state.pool, sizeof(Info) + sizeof(reg_post_info), pool_tag("CmNt"));
+			if (!scratch->addr()) return STATUS_INSUFFICIENT_RESOURCES;
+			space.write_mem(scratch->addr(), original);
+			frames.push_back({std::move(scratch)});
+			const auto result = state.call_registry_notify(cpu, *registration, pre_class, frames[index].scratch->addr());
+			auto returned = space.read_mem<Info>(frames[index].scratch->addr());
+			frames[index].context = returned.call_context;
+			returned.call_context = original.call_context;
+			// Stopping filters may completely handle the request. For continuing
+			// filters only CallContext is writable; IN-field redirection is deferred.
+			if (result != win::registry_notify_service::bypass && !(result & 0x80000000u)
+				&& returned != original) return STATUS_NOT_SUPPORTED;
+			return result;
+		}, std::forward<Body>(body),
+		[&](const auto& registration, std::size_t index, std::uint32_t status) {
+			const auto pre = frames[index].scratch->addr();
+			const auto post = pre + sizeof(Info);
+			space.write_mem(post, reg_post_info{.object = host->body, .status = status,
+				.pre_information = pre, .return_status = status, .call_context = frames[index].context});
+			const auto result = state.call_registry_notify(cpu, *registration, post_class, post);
+			return win::registry_notify_service::post_result{result, space.read_mem<reg_post_info>(post).return_status};
+		});
+}
 
 constexpr NTSTATUS status_flt_instance_altitude_collision = 0xC01C0011;
 
@@ -259,7 +367,8 @@ std::uint64_t open_key_handle(win_kernel_state& state, std::shared_ptr<win_regis
 
 	const std::uint8_t body[sizeof(addr_t)] = {};
 	const auto addr = state.objs.create_object(0, body, sizeof(body),
-		std::move(host), prot_rw | prot_supervisor);
+		host, prot_rw | prot_supervisor);
+	host->body = addr;
 
 	return addr ? state.sys_proc->handle_table().create_handle(addr, access) : 0;
 }
@@ -433,7 +542,7 @@ void modules::register_ntoskrnl_reg_ops(win_kernel_state& state, proc_module& mo
 				max_value_name = std::max(max_value_name,
 					static_cast<std::uint32_t>(value_name.size() * sizeof(char16_t)));
 
-				if (const auto* value = host->key->query_value(value_name))
+				if (const auto value = host->key->copy_value(value_name))
 					max_value_data = std::max(max_value_data,
 						static_cast<std::uint32_t>(value->data.size()));
 			}
@@ -500,38 +609,28 @@ void modules::register_ntoskrnl_reg_ops(win_kernel_state& state, proc_module& mo
 		const std::uint32_t length, emu_object<std::uint32_t> result_length) -> NTSTATUS
 	{
 		const auto host = key_from_handle(*st, key_handle);
-
-		if (!host)
-			return STATUS_INVALID_HANDLE;
-
-		const auto name = win::read_unicode_string(value_name);
+		if (!host) return STATUS_INVALID_HANDLE;
+		auto& space = *cpu.curr_addr_space();
+		std::u16string name;
+		const auto captured = capture_value_name(space, value_name, name);
+		if (captured != STATUS_SUCCESS) return captured;
+		if (!registry_buffer(space, result_length.address(), sizeof(std::uint32_t))
+			|| !registry_buffer(space, key_value_information, length)) return STATUS_ACCESS_VIOLATION;
 		const auto narrow = narrow_wstring(name);
-		const auto* value = host->key->query_value(narrow);
-
-		if (!value)
-		{
-			THREAD_LOG_INFO("ZwQueryValueKey('{}'): no value '{}'", host->path, narrow);
-
-			if (result_length)
-				result_length.write(0);
-
-			return STATUS_OBJECT_NAME_NOT_FOUND;
-		}
-
-		const auto response = value_response(key_value_information_class, name, *value);
-
-		if (response.empty())
-		{
-			THREAD_LOG_WARN("ZwQueryValueKey: unhandled class {}", key_value_information_class);
-			return STATUS_INVALID_INFO_CLASS;
-		}
-
-		THREAD_LOG_INFO("ZwQueryValueKey('{}', '{}', class={}): type={}, {} bytes",
-			host->path, narrow, key_value_information_class,
-			static_cast<std::uint32_t>(value->type), value->data.size());
-
-		return write_info(*cpu.curr_addr_space(), response, key_value_information, length,
-			result_length, "ZwQueryValueKey");
+		const reg_query_value_info info{.object = host->body, .value_name = value_name.address(),
+			.info_class = key_value_information_class, .information = key_value_information,
+			.length = length, .result_length = result_length.address()};
+		return registry_value_operation(*st, cpu, host, info, 8, 23, [&]() -> NTSTATUS {
+			// Lookup after pre: a nested write must be visible to this query. Copy
+			// while holding the store lock, then release it before guest output/post.
+			const auto value = host->key->copy_value(narrow);
+			if (!registry_buffer(space, result_length.address(), sizeof(std::uint32_t))
+				|| !registry_buffer(space, key_value_information, length)) return STATUS_ACCESS_VIOLATION;
+			if (!value) { result_length.write(0); return STATUS_OBJECT_NAME_NOT_FOUND; }
+			const auto response = value_response(key_value_information_class, name, *value);
+			if (response.empty()) return STATUS_INVALID_INFO_CLASS;
+			return write_info(space, response, key_value_information, length, result_length, "ZwQueryValueKey");
+		});
 	};
 
 	auto enumerate_value_key = [st](vcpu& cpu, const std::uint64_t key_handle,
@@ -553,7 +652,7 @@ void modules::register_ntoskrnl_reg_ops(win_kernel_state& state, proc_module& mo
 			return STATUS_NO_MORE_ENTRIES;
 		}
 
-		const auto* value = host->key->query_value(names[index]);
+		const auto value = host->key->copy_value(names[index]);
 
 		if (!value)
 			return STATUS_OBJECT_NAME_NOT_FOUND;
@@ -575,43 +674,40 @@ void modules::register_ntoskrnl_reg_ops(win_kernel_state& state, proc_module& mo
 	};
 
 	auto set_value_key = [st](vcpu& cpu, const std::uint64_t key_handle,
-		emu_object<_UNICODE_STRING> value_name, [[maybe_unused]] const std::uint32_t title_index,
+		emu_object<_UNICODE_STRING> value_name, const std::uint32_t title_index,
 		const std::uint32_t type, const addr_t data, const std::uint32_t data_size) -> NTSTATUS
 	{
 		const auto host = key_from_handle(*st, key_handle);
-
-		if (!host)
-			return STATUS_INVALID_HANDLE;
-
-		const auto narrow = narrow_wstring(win::read_unicode_string(value_name));
-
+		if (!host) return STATUS_INVALID_HANDLE;
+		auto& space = *cpu.curr_addr_space();
+		std::u16string name;
+		const auto captured = capture_value_name(space, value_name, name);
+		if (captured != STATUS_SUCCESS) return captured;
+		if (!registry_buffer(space, data, data_size)) return STATUS_ACCESS_VIOLATION;
 		std::vector<std::uint8_t> bytes(data_size);
-
-		if (data_size && data)
-			cpu.curr_addr_space()->read_mem(data, bytes.data(), data_size);
-
-		host->key->set_value(narrow, static_cast<registry_type>(type), bytes);
-
-		THREAD_LOG_INFO("ZwSetValueKey('{}', '{}', type={}, {} bytes)",
-			host->path, narrow, type, data_size);
-
-		return STATUS_SUCCESS;
+		if (data_size) space.read_mem(data, bytes.data(), data_size);
+		const auto narrow = narrow_wstring(name);
+		const reg_set_value_info info{.object = host->body, .value_name = value_name.address(),
+			.title_index = title_index, .type = type, .data = data, .data_size = data_size};
+		return registry_value_operation(*st, cpu, host, info, 1, 16, [&]() -> NTSTATUS {
+			host->key->set_value(narrow, static_cast<registry_type>(type), bytes);
+			return STATUS_SUCCESS;
+		});
 	};
 
-	auto delete_value_key = [st](vcpu&, const std::uint64_t key_handle,
+	auto delete_value_key = [st](vcpu& cpu, const std::uint64_t key_handle,
 		emu_object<_UNICODE_STRING> value_name) -> NTSTATUS
 	{
 		const auto host = key_from_handle(*st, key_handle);
-
-		if (!host)
-			return STATUS_INVALID_HANDLE;
-
-		const auto narrow = narrow_wstring(win::read_unicode_string(value_name));
-		const bool deleted = host->key->delete_value(narrow);
-
-		THREAD_LOG_INFO("ZwDeleteValueKey('{}', '{}') -> {}", host->path, narrow, deleted);
-
-		return deleted ? STATUS_SUCCESS : STATUS_OBJECT_NAME_NOT_FOUND;
+		if (!host) return STATUS_INVALID_HANDLE;
+		std::u16string name;
+		const auto captured = capture_value_name(*cpu.curr_addr_space(), value_name, name);
+		if (captured != STATUS_SUCCESS) return captured;
+		const auto narrow = narrow_wstring(name);
+		const reg_delete_value_info info{.object = host->body, .value_name = value_name.address()};
+		return registry_value_operation(*st, cpu, host, info, 2, 17, [&]() -> NTSTATUS {
+			return host->key->delete_value(narrow) ? STATUS_SUCCESS : STATUS_OBJECT_NAME_NOT_FOUND;
+		});
 	};
 
 	auto delete_key = [st](vcpu&, const std::uint64_t key_handle) -> NTSTATUS
@@ -739,7 +835,7 @@ void modules::register_ntoskrnl_reg_ops(win_kernel_state& state, proc_module& mo
 					continue;
 				}
 
-				const auto* value = key ? key->query_value(name) : nullptr;
+				const auto value = key ? key->copy_value(name) : std::nullopt;
 
 				if (!value)
 				{
@@ -775,80 +871,50 @@ void modules::register_ntoskrnl_reg_ops(win_kernel_state& state, proc_module& mo
 			return STATUS_SUCCESS;
 		});
 
-	// The records live with these per-emulator handlers; registry callback delivery is unsupported.
-	auto cm_callbacks = std::make_shared<win::callbacks::registry<std::int64_t,
-		win::callbacks::cm_registration>>(1);
+	// Registrations and whole-operation rundown belong to this emulator instance.
 	state.redirect(mod, "CmRegisterCallbackEx",
-		[cm_callbacks](vcpu& cpu, const addr_t function, emu_object<_UNICODE_STRING> altitude,
+		[st](vcpu& cpu, const addr_t function, emu_object<_UNICODE_STRING> altitude,
 			const addr_t driver, const addr_t context,
 			emu_object<std::int64_t> cookie, const addr_t reserved) -> NTSTATUS
 		{
-			if (!function || !altitude || !driver || !cookie || reserved)
-				return STATUS_INVALID_PARAMETER;
-
-			win::callbacks::registry<std::int64_t,
-				win::callbacks::cm_registration>::insert_result inserted{
-					.status = win::callbacks::insert_status::identifier_exhausted,
-				};
-			std::string altitude_log;
+			if (!function || !altitude || !driver || !cookie || reserved) return STATUS_INVALID_PARAMETER;
 			try
 			{
 				auto& space = *cpu.curr_addr_space();
-				const auto altitude_value = callback_altitude(space, altitude.read());
-				if (!altitude_value)
-					return STATUS_INVALID_PARAMETER;
-				altitude_log = narrow_wstring(*altitude_value);
-
-				win::callbacks::cm_registration copied{
-					.function = function,
-					.context = context,
-					.altitude = *altitude_value,
-					.driver = driver,
-				};
-				inserted = cm_callbacks->insert(std::move(copied),
-					[&cookie](const std::int64_t value)
-					{
-						cookie.write(value);
-					});
+				if (!registry_buffer(space, altitude.address(), sizeof(_UNICODE_STRING))) return STATUS_ACCESS_VIOLATION;
+				const auto us = altitude.read();
+				if (!registry_buffer(space, guest_va(us.Buffer), us.Length)) return STATUS_ACCESS_VIOLATION;
+				const auto value = callback_altitude(space, us);
+				if (!value) return STATUS_INVALID_PARAMETER;
+				const auto result = st->registry_notify.add({function, context, *value, driver}, [&](std::int64_t id) {
+					if (!registry_buffer(space, cookie.address(), sizeof(id))) throw std::runtime_error("invalid cookie output");
+					cookie.write(id);
+				});
+				using status = win::registry_notify_service::add_status;
+				switch (result)
+				{
+				case status::success: return STATUS_SUCCESS;
+				case status::invalid_altitude: return STATUS_INVALID_PARAMETER;
+				case status::collision: return status_flt_instance_altitude_collision;
+				case status::output_failed: return STATUS_ACCESS_VIOLATION;
+				case status::exhausted: return STATUS_INSUFFICIENT_RESOURCES;
+				}
 			}
-			catch (const std::bad_alloc&)
-			{
-				return STATUS_INSUFFICIENT_RESOURCES;
-			}
-			catch (const std::exception&)
-			{
-				return STATUS_INVALID_PARAMETER;
-			}
-
-			switch (inserted.status)
-			{
-			case win::callbacks::insert_status::altitude_collision:
-				return status_flt_instance_altitude_collision;
-			case win::callbacks::insert_status::output_write_failed:
-				return STATUS_ACCESS_VIOLATION;
-			case win::callbacks::insert_status::identifier_exhausted:
-				return STATUS_INSUFFICIENT_RESOURCES;
-			case win::callbacks::insert_status::success:
-				THREAD_LOG_WARN("CmRegisterCallbackEx(function=0x{:X}, altitude='{}', driver=0x{:X}, "
-					"context=0x{:X}) -> cookie={}: registry callback delivery is unsupported",
-					function, altitude_log, driver, context, inserted.id);
-				return STATUS_SUCCESS;
-			}
+			catch (const std::bad_alloc&) { return STATUS_INSUFFICIENT_RESOURCES; }
+			catch (const std::exception&) { return STATUS_ACCESS_VIOLATION; }
 			return STATUS_UNSUCCESSFUL;
 		});
 
 	state.redirect(mod, "CmUnRegisterCallback",
-		[cm_callbacks](vcpu&, const std::int64_t cookie) -> NTSTATUS
-		{
-			if (!cm_callbacks->unregister(cookie))
+		[st](vcpu& cpu, const std::int64_t cookie) -> NTSTATUS {
+			const auto result = st->registry_notify.remove(cookie, st->in_lifecycle_callback(cpu.id()));
+			if (result == win::registry_notify_service::remove_status::callback_deadlock)
 			{
-				THREAD_LOG_WARN("CmUnRegisterCallback(cookie={}) -> STATUS_INVALID_PARAMETER", cookie);
-				return STATUS_INVALID_PARAMETER;
+				THREAD_LOG_ERR("registry notify: CmUnRegisterCallback: callback rundown deadlock");
+				st->fail_thread_notify(cpu, "registry callback rundown deadlock");
 			}
-
-			THREAD_LOG_INFO("CmUnRegisterCallback(cookie={}) -> removed; registry callback delivery "
-				"is unsupported", cookie);
-			return STATUS_SUCCESS;
+			return result == win::registry_notify_service::remove_status::removed
+				? STATUS_SUCCESS : STATUS_INVALID_PARAMETER;
 		});
 
 	// Nothing here notices a registry write, so the watch is accepted and the event stays unset.

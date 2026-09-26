@@ -9,6 +9,7 @@
 #include "modules/ntoskrnl.hpp"
 #include "boot_seed.hpp"
 #include "registry.hpp"
+#include "registry_notify.hpp"
 #include "filesystem.hpp"
 #include "ethread.hpp"
 #include "thread.hpp"
@@ -57,8 +58,11 @@ struct win_kernel_state : kernel_state
 	win::thread_notify_registry thread_notify;
 	// Modern Windows supports up to 64 load-image registrations per instance.
 	win::lifecycle_notify_registry image_notify{64};
+	win::registry_notify_service registry_notify;
 	bool in_lifecycle_callback(std::size_t cpu) const
-	{ return thread_notify.in_callback(cpu) || image_notify.in_callback(cpu); }
+	{ return thread_notify.in_callback(cpu) || image_notify.in_callback(cpu) || registry_notify.in_callback(cpu); }
+	NTSTATUS call_registry_notify(vcpu& cpu, const win::registry_notify_service::record& registration,
+		std::uint32_t notification, addr_t information);
 	void notify_image(vcpu& cpu, std::string_view path, addr_t base, std::uint64_t size);
 	void notify_thread(vcpu& cpu, const win_thread& target, bool create);
 	void finish_thread(vcpu& cpu, NTSTATUS status);

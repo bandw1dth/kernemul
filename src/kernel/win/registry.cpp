@@ -9,12 +9,12 @@
 void win_registry_key::set_value(const std::string_view name, const registry_type type,
 	const void* data, const std::size_t size)
 {
-	auto& entry = values_[std::string(name)];
-	entry.type = type;
-	entry.data.resize(size);
+	registry_value entry{type, std::vector<std::uint8_t>(size)};
 
 	if (data && size > 0)
 		std::memcpy(entry.data.data(), data, size);
+	std::lock_guard lock(mutex_);
+	values_.insert_or_assign(std::string(name), std::move(entry));
 }
 
 void win_registry_key::set_value(const std::string_view name, const registry_type type,
@@ -25,12 +25,22 @@ void win_registry_key::set_value(const std::string_view name, const registry_typ
 
 const registry_value* win_registry_key::query_value(const std::string_view name) const
 {
+	// Legacy pointer API: valid only until the next mutation. Live guest paths use copy_value.
+	std::lock_guard lock(mutex_);
 	const auto it = values_.find(std::string(name));
 	return it != values_.end() ? &it->second : nullptr;
 }
 
+std::optional<registry_value> win_registry_key::copy_value(const std::string_view name) const
+{
+	std::lock_guard lock(mutex_);
+	const auto it = values_.find(std::string(name));
+	return it == values_.end() ? std::nullopt : std::optional(it->second);
+}
+
 bool win_registry_key::delete_value(const std::string_view name)
 {
+	std::lock_guard lock(mutex_);
 	return values_.erase(std::string(name)) > 0;
 }
 
@@ -69,6 +79,7 @@ void win_registry_key::set_binary(const std::string_view name, const std::span<c
 
 std::vector<std::string> win_registry_key::enumerate_values() const
 {
+	std::lock_guard lock(mutex_);
 	std::vector<std::string> result;
 	result.reserve(values_.size());
 
@@ -81,12 +92,14 @@ std::vector<std::string> win_registry_key::enumerate_values() const
 
 std::shared_ptr<win_registry_key> win_registry::open_key(const std::string_view path) const
 {
+	std::lock_guard lock(mutex_);
 	const auto it = keys_.find(std::string(path));
 	return it != keys_.end() ? it->second : nullptr;
 }
 
 std::shared_ptr<win_registry_key> win_registry::create_key(const std::string_view path)
 {
+	std::lock_guard lock(mutex_);
 	const auto path_str = std::string(path);
 	const auto it = keys_.find(path_str);
 
@@ -111,16 +124,19 @@ std::shared_ptr<win_registry_key> win_registry::create_key(const std::string_vie
 
 bool win_registry::delete_key(const std::string_view path)
 {
+	std::lock_guard lock(mutex_);
 	return keys_.erase(std::string(path)) > 0;
 }
 
 bool win_registry::key_exists(const std::string_view path) const
 {
+	std::lock_guard lock(mutex_);
 	return keys_.contains(std::string(path));
 }
 
 std::vector<std::string> win_registry::enumerate_subkeys(const std::string_view parent_path) const
 {
+	std::lock_guard lock(mutex_);
 	const auto prefix = std::string(parent_path) + "/";
 	std::set<std::string> subkeys;
 

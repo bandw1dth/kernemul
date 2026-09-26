@@ -36,6 +36,8 @@ It does not install a Windows driver. Run fixtures from PowerShell 7 (`pwsh`) wi
 .\tests\scripts\run-conformance.ps1 -Driver thread_notify_boundaries
 .\tests\scripts\run-conformance.ps1 -Driver image_notify_conformance
 .\tests\scripts\run-conformance.ps1 -Driver image_notify_boundaries
+.\tests\scripts\run-conformance.ps1 -Driver registry_notify_conformance
+.\tests\scripts\run-conformance.ps1 -Driver registry_notify_boundaries
 .\tests\scripts\run-model-tests.ps1
 .\tests\scripts\run-negative-tests.ps1
 ```
@@ -60,7 +62,9 @@ versions. Do not load the unsigned fixture into the host as part of this workflo
 1. Extend lifecycle delivery to process creation, kernel driver loads, Ex thread
    modes, and target-context remote termination. Guest image-section mappings now
    deliver notifications; see [image mapping](image-mapping.md) for scope and tests.
-2. Object/registry pre/post operation delivery using the retained registrations.
+2. Object-handle pre/post delivery and remaining registry operations. Registry
+   value set/query/delete now have a filtering pipeline; see
+   [registry notifications](registry-notifications.md) for scope and contracts.
 3. Coherent process-local handles and guest EPROCESS.ObjectTable representation.
 4. Memory invariants across MMU, PFN, MDL, allocations, and guest-visible metadata.
 5. Build-pinned CI verification contracts, fixtures, and policy behavior.
@@ -86,7 +90,8 @@ separate multiprocessor validation.
 Executive callback delivery rechecks active registration state before invoking each
 record. Unregister prevents future dispatch, but does not drain an already in-flight
 callback on another vCPU. Full callback rundown needs scheduler-aware completion.
-Object and registry registration retention does not imply operation delivery.
+Object registration retention does not imply operation delivery. Registry value
+operations now deliver pre/post callbacks; other registry paths remain deferred.
 Registrations copy caller-owned data, enforce altitude collisions, and invalidate
 exact handles/cookies on removal. Executive callbacks have the Windows-owned
 `PowerState` and `SetSystemTime` namespace objects available at startup. A callback

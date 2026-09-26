@@ -4,6 +4,60 @@
 #include "../thread_scheduler.hpp"
 #include "../../util/log.hpp"
 
+NTSTATUS win_kernel_state::call_registry_notify(vcpu& cpu,
+	const win::registry_notify_service::record& registration,
+	const std::uint32_t notification, const addr_t information)
+{
+	const auto caller = std::dynamic_pointer_cast<win_thread>(cpu.thread());
+	auto* const emu = emulator();
+	const auto scheduler = sys_proc->scheduler();
+	auto fail = [&](const char* reason) -> void {
+		THREAD_LOG_ERR("registry notify: {}", reason);
+		if (scheduler) scheduler->stop();
+		cpu.stop();
+		throw std::runtime_error(reason);
+	};
+	if (!caller || !caller->ethread() || !emu || cpu.in_dpc || emu->irql(cpu) != passive_level)
+		fail("callback requires a thread at PASSIVE_LEVEL");
+	const auto irql = emu->irql(cpu);
+	const auto kernel = caller->kernel_apc_disable().read();
+	const auto special = caller->special_apc_disable().read();
+	const auto sleep = caller->sleep_until();
+	auto restore = [&] {
+		emu->set_irql(cpu, irql);
+		caller->kernel_apc_disable().write(kernel);
+		caller->special_apc_disable().write(special);
+	};
+	const std::uint64_t args[] = {registration.value.context, notification, information};
+	++win::registry_callback_depth;
+	try
+	{
+		const auto result = static_cast<NTSTATUS>(calls.call(cpu, registration.value.function, args, 0, [&] {
+			if (caller->suspend_count() || caller->is_waiting() || caller->sleep_until() != sleep)
+				fail("callback cannot block or suspend");
+			return cpu.dpc_failed || cpu.execution_failed() || caller->is_finished()
+				|| (scheduler && scheduler->stopped());
+		}));
+		if (emu->irql(cpu) != irql || caller->kernel_apc_disable().read() != kernel
+			|| caller->special_apc_disable().read() != special)
+			fail("callback returned with unbalanced IRQL/APC context");
+		restore();
+		--win::registry_callback_depth;
+		return result;
+	}
+	catch (...)
+	{
+		--win::registry_callback_depth;
+		if (scheduler) scheduler->stop();
+		cpu.stop();
+		restore();
+		THREAD_LOG_ERR("registry notify: callback failed before returning; stopped");
+		THREAD_LOG_INFO("registry notify: restored irql={}, kernel_apc_disable={}, special_apc_disable={}",
+			emu->irql(cpu), caller->kernel_apc_disable().read(), caller->special_apc_disable().read());
+		throw;
+	}
+}
+
 [[noreturn]] void win_kernel_state::fail_thread_notify(vcpu& cpu, const char* reason)
 {
 	THREAD_LOG_ERR("thread notify: {}", reason);

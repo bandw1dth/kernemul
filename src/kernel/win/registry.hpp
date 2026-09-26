@@ -2,6 +2,8 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -33,6 +35,7 @@ public:
 	void set_value(std::string_view name, registry_type type, const void* data, std::size_t size);
 	void set_value(std::string_view name, registry_type type, std::span<const std::uint8_t> data);
 	[[nodiscard]] const registry_value* query_value(std::string_view name) const;
+	[[nodiscard]] std::optional<registry_value> copy_value(std::string_view name) const;
 	bool delete_value(std::string_view name);
 
 	void set_dword(std::string_view name, std::uint32_t value);
@@ -45,6 +48,7 @@ public:
 	[[nodiscard]] std::vector<std::string> enumerate_values() const;
 
 private:
+	mutable std::mutex mutex_;
 	std::unordered_map<std::string, registry_value> values_;
 };
 
@@ -60,5 +64,6 @@ public:
 	[[nodiscard]] static std::string normalize_path(std::u16string_view guest_path);
 
 private:
+	mutable std::mutex mutex_;
 	std::unordered_map<std::string, std::shared_ptr<win_registry_key>> keys_;
 };

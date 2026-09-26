@@ -20,6 +20,11 @@ foreach ($source in $sources) {
         $extra = @("$root\src\kernel\win\win_user_mem.cpp", "/I$root\$BuildDirectory\vcpkg_installed\x64-windows\include", '/DSPDLOG_USE_STD_FORMAT', '/Zc:preprocessor')
         $obj = "$out\"
     }
+    if ($source.BaseName -eq 'registry_value_model') {
+        # Exercise the production registry store and its copied-value synchronization.
+        $extra = @("$root\src\kernel\win\registry.cpp", "/I$root\$BuildDirectory\vcpkg_installed\x64-windows\include", '/DSPDLOG_USE_STD_FORMAT', '/Zc:preprocessor')
+        $obj = "$out\"
+    }
     & "$vc\bin\Hostx64\x64\cl.exe" /nologo /std:c++latest /EHsc /W4 /MT "/I$root\src" "/I$root\vendor\pe\src" "/I$vc\include" "/I$sdk\Include\$SdkVersion\ucrt" "/I$sdk\Include\$SdkVersion\um" "/I$sdk\Include\$SdkVersion\shared" "/Fo$obj" "/Fe$exe" $source.FullName @extra /link "/LIBPATH:$vc\lib\x64" "/LIBPATH:$sdk\Lib\$SdkVersion\ucrt\x64" "/LIBPATH:$sdk\Lib\$SdkVersion\um\x64"
     if ($LASTEXITCODE) { throw "Compile failed: $($source.Name)" }
     & $exe
