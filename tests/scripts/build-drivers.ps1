@@ -18,13 +18,19 @@ foreach ($source in $sources) {
     & "$vc\bin\Hostx64\x64\cl.exe" /nologo /c /TC /O1 /GS- /Zl /W4 /D_AMD64_ /DAMD64 /D_KERNEL_MODE @include "/Fo$obj" $source.FullName
     if ($LASTEXITCODE) { throw "Compile failed: $($source.Name)" }
     $extraLibraries = @()
+    $extraLinkFlags = @()
+    # Ex process-notify registration checks the containing image's FORCE_INTEGRITY bit.
+    # This sets the PE characteristic; it does not sign or install a host driver.
+    if ($source.BaseName -like 'process_notify_*' -and $source.BaseName -ne 'process_notify_integrity') {
+        $extraLinkFlags += '/integritycheck'
+    }
     if ($source.BaseName -eq 'ci_conformance') {
         $ciLibrary = Join-Path $out 'ci_fixture.lib'
         & "$vc\bin\Hostx64\x64\lib.exe" /nologo /machine:x64 "/def:$root\tests\drivers\ci_exports.def" "/out:$ciLibrary"
         if ($LASTEXITCODE) { throw 'CI fixture import library failed.' }
         $extraLibraries += $ciLibrary
     }
-    & "$vc\bin\Hostx64\x64\link.exe" /nologo /driver /subsystem:native /entry:DriverEntry /nodefaultlib /machine:x64 "/out:$sys" $obj "$sdk\Lib\$SdkVersion\km\x64\ntoskrnl.lib" "$sdk\Lib\$SdkVersion\km\x64\hal.lib" @extraLibraries
+    & "$vc\bin\Hostx64\x64\link.exe" /nologo /driver /subsystem:native /entry:DriverEntry /nodefaultlib /machine:x64 "/out:$sys" $obj "$sdk\Lib\$SdkVersion\km\x64\ntoskrnl.lib" "$sdk\Lib\$SdkVersion\km\x64\hal.lib" @extraLibraries @extraLinkFlags
     if ($LASTEXITCODE) { throw "Link failed: $($source.Name)" }
     Write-Output $sys
 }

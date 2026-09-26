@@ -1,9 +1,19 @@
 #Requires -Version 7.0
-param([int]$Seconds = 210, [string]$Image = 'vgk.sys')
+param([int]$Seconds = 210, [string]$Image = 'vgk.sys', [string[]]$UserImages = @())
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $guestImage = Join-Path (Join-Path $root 'fs_x86_64') $Image
 if (-not (Test-Path -LiteralPath $guestImage)) { throw "Guest image missing: $guestImage" }
+$guestApplications = [ordered]@{}
+foreach ($application in $UserImages) {
+    if ($application -match '[\s"]' -or $application -notmatch '\.exe$') {
+        throw 'UserImages must contain guest executable names without whitespace or quotes.'
+    }
+    $applicationPath = Join-Path (Join-Path $root 'fs_x86_64') $application
+    if (-not (Test-Path -LiteralPath $applicationPath)) { throw "Guest image missing: $applicationPath" }
+    $guestApplications[$application] = [ordered]@{ path = $applicationPath; sha256 = (Get-FileHash -LiteralPath $applicationPath).Hash }
+}
+$imageArguments = @($Image) + $UserImages
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
 $run = Join-Path $root "build-conformance\kernel-$stamp"
 New-Item -ItemType Directory -Force $run | Out-Null
@@ -20,15 +30,16 @@ $manifest = [ordered]@{
     kernelVersion = (Get-Item (Join-Path $root 'fs_x86_64\Windows\System32\ntoskrnl.exe')).VersionInfo.ProductVersion
     requestedSeconds = $Seconds; gitCommit = (& git -C $root rev-parse HEAD)
     stdout = $stdout; stderr = $stderr
+    arguments = $imageArguments; userImages = $guestApplications
 }
 $guestCi = Join-Path $root 'fs_x86_64\Windows\System32\ci.dll'
 if (Test-Path -LiteralPath $guestCi) {
     $manifest.ciSha256 = (Get-FileHash -LiteralPath $guestCi).Hash
     $manifest.ciVersion = (Get-Item -LiteralPath $guestCi).VersionInfo.ProductVersion
 }
-$manifest | ConvertTo-Json | Set-Content (Join-Path $run 'manifest.json')
+$manifest | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $run 'manifest.json')
 $timer = [Diagnostics.Stopwatch]::StartNew()
-$process = Start-Process -FilePath $exe -ArgumentList $Image -WorkingDirectory $root -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+$process = Start-Process -FilePath $exe -ArgumentList $imageArguments -WorkingDirectory $root -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
 $exited = $false
 while ($timer.Elapsed.TotalSeconds -lt $Seconds) {
     $remainingMs = [Math]::Max(1, [Math]::Min(30000, ($Seconds - $timer.Elapsed.TotalSeconds) * 1000))
@@ -39,6 +50,6 @@ $timer.Stop()
 $manifest.elapsedSeconds = $timer.Elapsed.TotalSeconds
 $manifest.stoppedAtLimit = -not $exited
 $manifest.exitCode = $process.ExitCode
-$manifest | ConvertTo-Json | Set-Content (Join-Path $run 'manifest.json')
-$manifest | ConvertTo-Json
+$manifest | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $run 'manifest.json')
+$manifest | ConvertTo-Json -Depth 5
 Get-Content -LiteralPath $stdout -Tail 15

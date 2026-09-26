@@ -151,7 +151,7 @@ void modules::register_ntoskrnl_ctx_ops(win_kernel_state& state, proc_module& mo
 		});
 
 	state.redirect_ntzw(mod, "RaiseException",
-		[](vcpu& cpu, emu_object<_EXCEPTION_RECORD> exception_record,
+		[st](vcpu& cpu, emu_object<_EXCEPTION_RECORD> exception_record,
 			[[maybe_unused]] emu_object<_CONTEXT> context, const bool first_chance)
 		{
 			const auto code = exception_record
@@ -164,11 +164,9 @@ void modules::register_ntoskrnl_ctx_ops(win_kernel_state& state, proc_module& mo
 				: 0;
 
 			THREAD_LOG_ERR("NtRaiseException(code=0x{:X}, at=0x{:X}, first_chance={}): nothing "
-				"delivers a software exception, so the thread ends here", code, at, first_chance);
+				"delivers a software exception; stopping the machine without a normal process exit", code, at, first_chance);
 
-			if (const auto t = cpu.thread())
-				t->finish();
-
+			st->sys_proc->scheduler()->stop();
 			cpu.stop();
 		});
 

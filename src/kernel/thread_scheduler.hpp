@@ -122,8 +122,9 @@ public:
 	[[nodiscard]] bool is_started() const noexcept { return started_; }
 	[[nodiscard]] time_point sleep_until() const { return sleep_until_; }
 
-	void finish() { finished_ = true; }
-	[[nodiscard]] bool is_finished() const { return finished_; }
+	// Publish completion and prior writes (including a derived thread's exit status).
+	void finish() { finished_.store(true, std::memory_order_release); }
+	[[nodiscard]] bool is_finished() const { return finished_.load(std::memory_order_acquire); }
 
 	[[nodiscard]] virtual bool is_user_mode() const { return false; }
 
@@ -138,7 +139,7 @@ protected:
 
 private:
 	time_point sleep_until_{};
-	bool finished_{false};
+	std::atomic<bool> finished_{false};
 };
 
 struct reg_view

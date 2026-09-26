@@ -5,6 +5,7 @@
 
 NTSTATUS win_kernel_state::delay_thread(vcpu& cpu, std::int64_t due)
 {
+	if (process_notify.in_callback(cpu.id())) fail_thread_notify(cpu, "process callback cannot delay execution");
 	if (cpu.in_dpc) throw std::runtime_error("DPC cannot delay execution");
 	const auto t = std::dynamic_pointer_cast<win_thread>(cpu.thread());
 	if (!t) return STATUS_INVALID_PARAMETER;

@@ -9,60 +9,13 @@
 #include "../../../util/log.hpp"
 #include <cstddef>
 #include <memory>
-#include <set>
 #include <string_view>
 
 namespace
 {
 
-struct notify_routines
-{
-	std::set<addr_t> process;
-};
-
-// What NT's fixed-size tables hold, and what a driver past the limit is told.
-constexpr std::size_t max_process_notify_routines = 64;
-
 static_assert(offsetof(_EPROCESS, Pcb) == 0,
 	"PsGetThreadProcess returns the containing EPROCESS for its KPROCESS pointer");
-
-NTSTATUS add_notify(std::set<addr_t>& routines, const std::size_t limit,
-	const std::string_view who, const addr_t routine)
-{
-	if (!routine)
-		return STATUS_INVALID_PARAMETER;
-
-	if (routines.contains(routine))
-	{
-		THREAD_LOG_WARN("{}: 0x{:X} is already registered", who, routine);
-		return STATUS_INVALID_PARAMETER;
-	}
-
-	if (routines.size() >= limit)
-	{
-		THREAD_LOG_ERR("{}: no room for 0x{:X}, {} already registered", who, routine, limit);
-		return STATUS_INSUFFICIENT_RESOURCES;
-	}
-
-	routines.insert(routine);
-
-	THREAD_LOG_WARN("{}(0x{:X}): registered, but nothing here will call it", who, routine);
-
-	return STATUS_SUCCESS;
-}
-
-NTSTATUS remove_notify(std::set<addr_t>& routines, const std::string_view who, const addr_t routine)
-{
-	if (!routines.erase(routine))
-	{
-		THREAD_LOG_WARN("{}: 0x{:X} was not registered", who, routine);
-		return STATUS_PROCEDURE_NOT_FOUND;
-	}
-
-	THREAD_LOG_INFO("{}(0x{:X}): removed", who, routine);
-
-	return STATUS_SUCCESS;
-}
 
 emu_object<_EPROCESS> process_or_current(win_kernel_state& state, vcpu& cpu,
 	const emu_object<_EPROCESS>& process)
@@ -82,7 +35,6 @@ emu_object<_EPROCESS> process_or_current(win_kernel_state& state, vcpu& cpu,
 void modules::register_ntoskrnl_process_ops(win_kernel_state& state, proc_module& mod)
 {
 	auto* st = &state;
-	auto notify = std::make_shared<notify_routines>();
 
 	// The image name is fifteen bytes inside the EPROCESS, so the pointer is into the caller's own.
 	state.redirect(mod, "PsGetProcessImageFileName",
@@ -400,23 +352,36 @@ void modules::register_ntoskrnl_process_ops(win_kernel_state& state, proc_module
 			return STATUS_UNSUCCESSFUL;
 		});
 
-	// The tables are kept so a remove and a duplicate answer correctly; no notification comes.
+	auto process_notify = [st](vcpu& cpu, const addr_t routine, const std::uint8_t remove,
+		const win::process_notify_kind kind) -> NTSTATUS
+	{
+		if (remove)
+		{
+			if (st->in_lifecycle_callback(cpu.id()))
+				st->fail_thread_notify(cpu, "process callback removal inside lifecycle callback is unsupported");
+			const auto result = st->process_notify.remove(routine, kind, cpu.id(), st->in_lifecycle_callback(cpu.id()));
+			if (result == win::process_notify_registry::remove_result::callback_deadlock)
+				st->fail_thread_notify(cpu, "process callback removal would deadlock");
+			return result == win::process_notify_registry::remove_result::removed ? STATUS_SUCCESS : STATUS_INVALID_PARAMETER;
+		}
+		if (!routine) return STATUS_INVALID_PARAMETER;
+		if (kind == win::process_notify_kind::extended)
+		{
+			const auto owner = st->sys_proc->find_module_by_addr(routine);
+			// Admission checks only this PE bit, not a signature or trust policy.
+			if (!owner || !owner->pe() || !(owner->pe()->nt_hdrs()->optional_hdr.dll_characteristics & 0x80))
+				return STATUS_ACCESS_DENIED;
+		}
+		try { return st->process_notify.add(routine, kind) ? STATUS_SUCCESS : STATUS_INVALID_PARAMETER; }
+		catch (const std::bad_alloc&) { return STATUS_INSUFFICIENT_RESOURCES; }
+	};
 	state.redirect(mod, "PsSetCreateProcessNotifyRoutine",
-		[notify](vcpu&, const addr_t notify_routine, const std::uint8_t remove) -> NTSTATUS
-		{
-			return remove
-				? remove_notify(notify->process, "PsSetCreateProcessNotifyRoutine", notify_routine)
-				: add_notify(notify->process, max_process_notify_routines,
-					"PsSetCreateProcessNotifyRoutine", notify_routine);
+		[process_notify](vcpu& cpu, addr_t routine, std::uint8_t remove) -> NTSTATUS {
+			return process_notify(cpu, routine, remove, win::process_notify_kind::classic);
 		});
-
 	state.redirect(mod, "PsSetCreateProcessNotifyRoutineEx",
-		[notify](vcpu&, const addr_t notify_routine, const std::uint8_t remove) -> NTSTATUS
-		{
-			return remove
-				? remove_notify(notify->process, "PsSetCreateProcessNotifyRoutineEx", notify_routine)
-				: add_notify(notify->process, max_process_notify_routines,
-					"PsSetCreateProcessNotifyRoutineEx", notify_routine);
+		[process_notify](vcpu& cpu, addr_t routine, std::uint8_t remove) -> NTSTATUS {
+			return process_notify(cpu, routine, remove, win::process_notify_kind::extended);
 		});
 
 	state.redirect(mod, "PsSetCreateThreadNotifyRoutine",

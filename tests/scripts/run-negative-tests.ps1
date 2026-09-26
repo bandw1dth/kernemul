@@ -102,7 +102,7 @@ foreach ($name in $Driver) {
         $forbiddenPattern = 'FORBIDDEN_POST_WAIT|FORBIDDEN_POST_NOTIFY|SETUP_FAILED|CONFORMANCE FAIL'
     }
     $markers = [ordered]@{}
-    $passed = $exited -and $process.ExitCode -eq 0 -and [string]::IsNullOrWhiteSpace($errorLog)
+    $passed = $exited -and $process.ExitCode -eq 1 -and [string]::IsNullOrWhiteSpace($errorLog)
     foreach ($key in $required.Keys) {
         $markers[$key] = [regex]::Matches($log, $required[$key]).Count
         if ($markers[$key] -ne 1) { $passed = $false }

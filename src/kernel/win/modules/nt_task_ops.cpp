@@ -321,6 +321,7 @@ void modules::register_ntoskrnl_task_ops(win_kernel_state& state, proc_module& m
 	auto terminate_thread = [st](vcpu& cpu, const std::uint64_t thread_handle,
 		const NTSTATUS exit_status) -> NTSTATUS
 	{
+		if (st->in_lifecycle_callback(cpu.id())) st->fail_thread_notify(cpu, "termination inside lifecycle callback");
 		const auto self = cpu.thread();
 
 		// A thread ending itself passes no handle at all -- RtlExitUserThread does -- and a
@@ -344,6 +345,9 @@ void modules::register_ntoskrnl_task_ops(win_kernel_state& state, proc_module& m
 			return STATUS_SUCCESS;
 		}
 
+		// Remote user teardown cannot supply the required last-thread callback context.
+		if (std::dynamic_pointer_cast<win_user_proc>(t->proc()) || st->process_notify.has_live())
+			return STATUS_NOT_SUPPORTED;
 		// The thread's own process: a user thread is not on the system process's lists.
 		if (!st->thread_notify.without_live_notifications([&]
 		{
@@ -731,7 +735,7 @@ void modules::register_ntoskrnl_task_ops(win_kernel_state& state, proc_module& m
 			return STATUS_INVALID_HANDLE;
 		}
 
-		if (t == cpu.thread() && st->in_lifecycle_callback(cpu.id()))
+		if (st->in_lifecycle_callback(cpu.id()))
 			st->fail_thread_notify(cpu, "NtSuspendThread: self-suspension inside a lifecycle callback is unsupported");
 
 		const auto previous = t->suspend();
@@ -847,6 +851,7 @@ void modules::register_ntoskrnl_task_ops(win_kernel_state& state, proc_module& m
 	auto terminate_process = [st](vcpu& cpu, const std::uint64_t process_handle,
 		const NTSTATUS exit_status) -> NTSTATUS
 	{
+		if (st->in_lifecycle_callback(cpu.id())) st->fail_thread_notify(cpu, "process termination inside lifecycle callback");
 		if (process_handle != 0 && process_handle != current_process_handle)
 		{
 			THREAD_LOG_WARN("NtTerminateProcess: handle 0x{:X} is not this process",
@@ -867,12 +872,14 @@ void modules::register_ntoskrnl_task_ops(win_kernel_state& state, proc_module& m
 
 		target.for_each_thread([&](win_thread& t)
 		{
-			if (!self || t.id() != self->id())
+			if ((!self || t.id() != self->id()) && !t.is_finished())
 				ids.push_back(t.id());
 		});
 
 		THREAD_LOG_INFO("NtTerminateProcess(status=0x{:X}): ending {} other thread(s)",
 			exit_status, ids.size());
+
+		if (!ids.empty() && st->process_notify.has_live()) return STATUS_NOT_SUPPORTED;
 
 		if (!ids.empty() && !st->thread_notify.without_live_notifications([&]
 		{

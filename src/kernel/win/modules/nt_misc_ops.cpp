@@ -149,15 +149,13 @@ void modules::register_ntoskrnl_misc_ops(win_kernel_state& state, proc_module& m
 
 	// A bugcheck is the end of the machine, so it is the end of the guest here.
 	state.redirect(mod, "KeBugCheckEx",
-		[](vcpu& cpu, const std::uint32_t code, const std::uint64_t p1, const std::uint64_t p2,
+		[st = &state](vcpu& cpu, const std::uint32_t code, const std::uint64_t p1, const std::uint64_t p2,
 			const std::uint64_t p3, const std::uint64_t p4)
 		{
 			THREAD_LOG_ERR("KeBugCheckEx(0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}): the guest "
 				"stopped the machine", code, p1, p2, p3, p4);
 
-			if (const auto t = cpu.thread())
-				t->finish();
-
+			st->sys_proc->scheduler()->stop();
 			cpu.stop();
 		});
 

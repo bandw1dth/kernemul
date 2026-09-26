@@ -15,6 +15,7 @@
 #include "ethread.hpp"
 #include "thread.hpp"
 #include "thread_notify.hpp"
+#include "process_notify.hpp"
 #include "section_views.hpp"
 #include "driver.hpp"
 #include "irp.hpp"
@@ -57,6 +58,7 @@ struct win_kernel_state : kernel_state
 	// One per machine: the trampoline it returns through is a single address.
 	guest_caller calls;
 	win::thread_notify_registry thread_notify;
+	win::process_notify_registry process_notify;
 	// Modern Windows supports up to 64 load-image registrations per instance.
 	win::lifecycle_notify_registry image_notify{64};
 	win::registry_notify_service registry_notify;
@@ -70,10 +72,14 @@ struct win_kernel_state : kernel_state
 		std::uint32_t attributes, emu_object<std::uint64_t> output,
 		std::uint32_t operation = 1, std::uint32_t access_ceiling = 0xffffffff);
 	bool in_lifecycle_callback(std::size_t cpu) const
-	{ return thread_notify.in_callback(cpu) || image_notify.in_callback(cpu) || registry_notify.in_callback(cpu) || ob_notify.in_callback(cpu); }
+	{ return process_notify.in_callback(cpu) || thread_notify.in_callback(cpu) || image_notify.in_callback(cpu) || registry_notify.in_callback(cpu) || ob_notify.in_callback(cpu); }
 	NTSTATUS call_registry_notify(vcpu& cpu, const win::registry_notify_service::record& registration,
 		std::uint32_t notification, addr_t information);
-	void notify_image(vcpu& cpu, std::string_view path, addr_t base, std::uint64_t size);
+	void notify_image(vcpu& cpu, std::string_view path, addr_t base, std::uint64_t size,
+		std::optional<process::id_type> subject = std::nullopt);
+	void call_lifecycle(vcpu& cpu, addr_t routine, std::span<const std::uint64_t> args, int context);
+	NTSTATUS notify_process(vcpu& cpu, windows_process& target, bool create);
+	void unpublish_process(windows_process& target);
 	void notify_thread(vcpu& cpu, const win_thread& target, bool create);
 	void finish_thread(vcpu& cpu, NTSTATUS status);
 	[[noreturn]] void fail_thread_notify(vcpu& cpu, const char* reason);
@@ -606,13 +612,15 @@ private:
 
 		std::scoped_lock lock(list_mtx_);
 		auto obj = active_process_list.push_back(ep);
-		objs.register_object(obj.address(), std::make_shared<process_identity_object>());
-
-		kprocess_thread_list(space, obj.address(),
-			std::format("KPROCESS.ThreadListHead[pid={}]", id), true).init();
-		eprocess_thread_list(space, obj.address(),
-			std::format("EPROCESS.ThreadListHead[pid={}]", id), true).init();
-
+		try
+		{
+			objs.register_object(obj.address(), std::make_shared<process_identity_object>());
+			kprocess_thread_list(space, obj.address(),
+				std::format("KPROCESS.ThreadListHead[pid={}]", id), true).init();
+			eprocess_thread_list(space, obj.address(),
+				std::format("EPROCESS.ThreadListHead[pid={}]", id), true).init();
+		}
+		catch (...) { active_process_list.remove(obj.address()); throw; }
 		return obj;
 	}
 
@@ -922,62 +930,12 @@ public:
 		std::shared_ptr<win_user_proc> proc;
 		std::shared_ptr<proc_module> image;
 		std::shared_ptr<thread> thread;
+		NTSTATUS status = STATUS_UNSUCCESSFUL;
+		bool admission_vetoed = false;
 	};
 
 	// The thread starts at ntdll's LdrInitializeThunk, not at the image's entry point.
-	user_process_args create_user_process(vcpu& cpu, const std::string_view exe_name)
-	{
-		auto proc = std::dynamic_pointer_cast<win_user_proc>(
-			kernel_.create_process(exe_name));
-
-		if (!proc)
-		{
-			LOG_ERR("failed to create a process for {}", exe_name);
-			return {};
-		}
-
-		proc->set_scheduler(&scheduler_);
-
-		const auto ntdll = proc->find_module(ntdll_name);
-
-		if (!ntdll)
-		{
-			LOG_ERR("{} is not in {}, so no user process can start",
-				ntdll_name, target::guest_fs_dir);
-			return {};
-		}
-
-		const auto image = proc->load_module(exe_name, false);
-
-		if (!image)
-		{
-			LOG_ERR("{} is not in {}", exe_name, target::guest_fs_dir);
-			return {};
-		}
-
-		proc->set_image_base(image->addr);
-
-		const auto ldr_init = ntdll->find_symbol(loader_thread_startup);
-
-		if (!ldr_init)
-		{
-			LOG_ERR("{}!{} not found", ntdll_name, loader_thread_startup);
-			return {};
-		}
-
-		auto t = proc->create_suspended_thread(cpu, *ldr_init);
-
-		if (!t)
-			return {};
-
-		setup_loader_frame(*t, cpu, image->entry_point, ntdll->addr, 0);
-		t->start();
-
-		LOG_INFO("user process {} (pid={}): image at 0x{:X}, entry 0x{:X}, loader at 0x{:X}",
-			exe_name, proc->id(), image->addr, image->entry_point, *ldr_init);
-
-		return { std::move(proc), image, std::move(t) };
-	}
+	user_process_args create_user_process(vcpu& cpu, std::string_view exe_name);
 
 private:
 	void timekeeper_tick() override { kernel_.update_time(); }
@@ -986,33 +944,24 @@ private:
 
 inline std::shared_ptr<process> win_kernel_state::create_process(const std::string_view name)
 {
-	std::unique_lock lock(proc_mtx_);
 	const auto id = objs.allocate_id();
 	auto& kspace = *emu_->default_addr_space();
 	const auto kusd_pa = *kspace.mmu_->virt_to_phys(kspace, kuser_shared_data_kernel_va);
 	auto space = emu_->mem()->create_addr_space();
-
-	// A new space copies the kernel half wholesale, and the self map slot is in that half --
-	// so without this the space's own self map names the kernel's tables rather than its
-	// own, and a walk through it describes somebody else's page tables. It is the one
-	// top-half entry that is not meant to be shared.
-	if (emulator_)
-		emulator_->prepare_addr_space(*space);
-
+	if (emulator_) emulator_->prepare_addr_space(*space);
 	auto proc = std::make_shared<win_user_proc>(id, std::move(space), objs, fs,
 		kusd_pa, name, emu_->cpus().size());
 	proc->set_emulator(emulator_);
-	processes[id] = proc;
-
-	if (active_process_list.address())
+	try
 	{
-		const auto eproc = insert_process(*emu_->default_addr_space(), id, name,
-			proc->peb().address());
-		proc->set_eprocess(eproc);
+		if (active_process_list.address())
+			proc->set_eprocess(insert_process(kspace, id,
+				name.substr(name.find_last_of("\\/") + 1), proc->peb().address()));
+		proc->owned_console = open_console();
+		proc->set_std_handles(proc->owned_console, proc->owned_console, proc->owned_console);
+		std::unique_lock lock(proc_mtx_);
+		processes[id] = proc;
 	}
-
-	const auto console = open_console();
-	proc->set_std_handles(console, console, console);
-
+	catch (...) { unpublish_process(*proc); throw; }
 	return proc;
 }

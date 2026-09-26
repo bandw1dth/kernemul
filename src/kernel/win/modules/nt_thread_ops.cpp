@@ -43,6 +43,7 @@ void modules::register_ntoskrnl_thread_ops(win_kernel_state& state, proc_module&
 			THREAD_LOG_INFO("PsCreateSystemThread(handle_out=0x{:X}, start=0x{:X}, ctx=0x{:X})",
 				thread_handle_out.address(), start_routine, start_context);
 
+			if (st->process_notify.in_callback(cpu.id())) st->fail_thread_notify(cpu, "thread creation inside process callback");
 			if (!thread_handle_out || !start_routine) return STATUS_INVALID_PARAMETER;
             if (st->ob_notify.in_callback(cpu.id())) st->fail_ob_notify(cpu, "nested handle operations are unsupported");
             if (process_handle && process_handle != static_cast<std::uint64_t>(-1)) return STATUS_NOT_SUPPORTED;

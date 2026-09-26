@@ -1,4 +1,5 @@
 #include "process.hpp"
+#include <utility>
 #include "thread.hpp"
 #include "win_kernel.hpp"
 #include "../thread_scheduler.hpp"
@@ -121,6 +122,88 @@ void win_kernel_state::call_ob_notify(vcpu& cpu, addr_t routine, addr_t context,
         restore();
         THREAD_LOG_ERR("ob notify: callback failed before returning; stopped");
         THREAD_LOG_INFO("ob notify: restored irql={}, kernel_apc_disable={}, special_apc_disable={}",
+            emu->irql(cpu), caller->kernel_apc_disable().read(), caller->special_apc_disable().read());
+        throw;
+    }
+}
+
+void win_kernel_state::call_lifecycle(vcpu& cpu, addr_t routine,
+    std::span<const std::uint64_t> args, const int context)
+{
+    const auto caller = std::dynamic_pointer_cast<win_thread>(cpu.thread());
+    auto* const emu = emulator();
+    const auto scheduler = sys_proc->scheduler();
+    if (!caller || !caller->ethread() || !emu || cpu.in_dpc || emu->irql(cpu) > (context == 0 ? apc_level : passive_level))
+        fail_thread_notify(cpu, "callback requires a thread at PASSIVE_LEVEL");
+    const auto irql = emu->irql(cpu);
+    const auto kernel = caller->kernel_apc_disable().read();
+    const auto special = caller->special_apc_disable().read();
+    if (context == 1 && kernel == std::numeric_limits<std::int16_t>::min())
+        fail_thread_notify(cpu, "callback critical-region counter overflow");
+    const auto delivery_kernel = context == 2 ? -1 : context == 1 ? kernel - 1 : kernel;
+    const auto delivery_special = context == 2 ? 0 : special;
+    const auto sleep = caller->sleep_until();
+    // Snapshot before raising privilege: guest_caller saves only the state at
+    // its own entry. Thread origin cannot tell whether a user thread is already
+    // executing a driver callback. Preserve the actual selectors/PSTATE and PCR.
+    const auto thread_regs = cpu.arch()->regs();
+    std::vector<reg_t> regs(thread_regs.begin(), thread_regs.end());
+#if defined(KERNEMUL_ARCH_ARM64)
+    // set_pcr also updates this per-CPU register, outside the thread snapshot.
+    regs.push_back(arm64::tpidr_el1);
+#endif
+    std::vector<reg_val> saved(regs.size());
+    for (std::size_t i = 0; i < regs.size(); ++i)
+        cpu.reg_read(regs[i], &saved[i], cpu.arch()->reg_size(regs[i]));
+    auto restore = [&] {
+        emu->set_irql(cpu, irql);
+        caller->kernel_apc_disable().write(kernel);
+        caller->special_apc_disable().write(special);
+        for (std::size_t i = 0; i < regs.size(); ++i)
+            cpu.reg_write(regs[i], &saved[i], cpu.arch()->reg_size(regs[i]));
+    };
+    unsigned local_depth = 0;
+    auto& depth = context == 2 ? win::process_callback_depth : local_depth;
+    ++depth;
+    try
+    {
+        // A syscall handler still has the caller's ring-3 stack and PCR. Use a
+        // supervisor stack for this delivery and return the exact incoming state.
+        const pool_block stack(pool, process::default_stack_size, pool_tag("LfSt"));
+        if (!stack.addr()) fail_thread_notify(cpu, "callback stack allocation failed");
+        emu->set_kernel_mode(cpu, true);
+        const auto pcpu = per_cpu(cpu.id());
+        if (!pcpu) fail_thread_notify(cpu, "callback requires a per-CPU kernel context");
+        emu->set_pcr(cpu, pcpu->address());
+        cpu.set_sp(stack.addr() + process::default_stack_size - process::stack_reserve);
+        // Establish callback delivery context, then restore the caller's.
+        caller->kernel_apc_disable().write(static_cast<std::int16_t>(delivery_kernel));
+        caller->special_apc_disable().write(static_cast<std::int16_t>(delivery_special));
+        calls.call(cpu, routine, args, 0, [&] {
+            if (caller->suspend_count() || caller->is_waiting() || caller->sleep_until() != sleep)
+                fail_thread_notify(cpu, context == 0 ? "blocking guest callbacks are unsupported" : "callback cannot block or suspend");
+            return cpu.dpc_failed || cpu.execution_failed() || caller->is_finished()
+                || (scheduler && scheduler->stopped());
+        });
+        if (cpu.dpc_failed || cpu.execution_failed() || caller->is_finished()
+            || (scheduler && scheduler->stopped())) fail_thread_notify(cpu, "callback execution failed");
+        if (caller->suspend_count() || caller->is_waiting() || caller->sleep_until() != sleep)
+            fail_thread_notify(cpu, context == 0 ? "blocking guest callbacks are unsupported" : "callback cannot block or suspend");
+        if (emu->irql(cpu) != irql || caller->kernel_apc_disable().read() != delivery_kernel
+            || caller->special_apc_disable().read() != delivery_special)
+            fail_thread_notify(cpu, "callback returned with unbalanced IRQL/APC context");
+        restore();
+        --depth;
+    }
+    catch (...)
+    {
+        --depth;
+        if (scheduler) scheduler->stop();
+        cpu.stop();
+        restore();
+        THREAD_LOG_ERR("lifecycle notify: callback failed before returning; stopped");
+        THREAD_LOG_INFO("{} notify: restored irql={}, kernel_apc_disable={}, special_apc_disable={}",
+            context == 2 ? "process" : context == 1 ? "image" : "thread",
             emu->irql(cpu), caller->kernel_apc_disable().read(), caller->special_apc_disable().read());
         throw;
     }
@@ -280,7 +363,6 @@ void win_kernel_state::notify_thread(vcpu& cpu, const win_thread& target, const 
 		fail_thread_notify(cpu, "classic callback requires PASSIVE_LEVEL or APC_LEVEL");
 	const auto caller = cpu.thread();
 	const auto win_caller = std::dynamic_pointer_cast<win_thread>(caller);
-	const auto sleep_before = caller ? caller->sleep_until() : thread::time_point{};
 	const auto scheduler = sys_proc->scheduler();
 	const auto irql_before = pcpu ? pcpu->irql() : passive_level;
 	const auto kernel_apc_before = win_caller ? win_caller->kernel_apc_disable().read() : 0;
@@ -292,16 +374,7 @@ void win_kernel_state::notify_thread(vcpu& cpu, const win_thread& target, const 
 		if (!thread_notify.acquire(registration, cpu.id())) continue;
 		try
 		{
-			calls.call(cpu, registration->routine, args, 0, [&]
-			{
-				if (win_caller && win_caller->suspend_count())
-					fail_thread_notify(cpu, "suspended lifecycle callbacks are unsupported");
-				if ((win_caller && win_caller->is_waiting())
-					|| (caller && caller->sleep_until() != sleep_before))
-					fail_thread_notify(cpu, "blocking guest callbacks are unsupported");
-				return cpu.dpc_failed || cpu.execution_failed() || (scheduler && scheduler->stopped())
-					|| (caller && caller->is_finished());
-			});
+			call_lifecycle(cpu, registration->routine, args, 0);
 			if ((pcpu && pcpu->irql() != irql_before)
 				|| (win_caller && (win_caller->kernel_apc_disable().read() != kernel_apc_before
 					|| win_caller->special_apc_disable().read() != special_apc_before)))
@@ -319,7 +392,7 @@ void win_kernel_state::notify_thread(vcpu& cpu, const win_thread& target, const 
 }
 
 void win_kernel_state::notify_image(vcpu& cpu, const std::string_view path,
-	const addr_t base, const std::uint64_t size)
+	const addr_t base, const std::uint64_t size, const std::optional<process::id_type> subject)
 {
 	const auto snapshot = image_notify.snapshot();
 	if (snapshot.empty()) return;
@@ -354,15 +427,13 @@ void win_kernel_state::notify_image(vcpu& cpu, const std::string_view path,
 	space.write_mem(info_address, image_info{.base = base, .size = size});
 	space.write_mem(name_address, us);
 	space.write_mem(buffer, name.c_str(), us.MaximumLength);
-	const std::uint64_t args[] = {name_address, caller->proc()->id(), info_address};
+	const std::uint64_t args[] = {name_address, subject.value_or(caller->proc()->id()), info_address};
 	const auto irql_before = emu->irql(cpu);
 	const auto kernel_before = caller->kernel_apc_disable().read();
 	const auto special_before = caller->special_apc_disable().read();
-	const auto sleep_before = caller->sleep_until();
 	const auto scheduler = sys_proc->scheduler();
 	if (kernel_before == std::numeric_limits<std::int16_t>::min())
 		fail_thread_notify(cpu, "image callback critical-region counter overflow");
-	const auto disabled = static_cast<std::int16_t>(kernel_before - 1);
 	auto restore = [&] {
 		emu->set_irql(cpu, irql_before);
 		caller->kernel_apc_disable().write(kernel_before);
@@ -374,16 +445,7 @@ void win_kernel_state::notify_image(vcpu& cpu, const std::string_view path,
 		++win::image_callback_depth;
 		try
 		{
-			caller->kernel_apc_disable().write(disabled);
-			calls.call(cpu, registration->routine, args, 0, [&] {
-				if (caller->suspend_count() || caller->is_waiting() || caller->sleep_until() != sleep_before)
-					fail_thread_notify(cpu, "image callback cannot block or suspend");
-				return cpu.dpc_failed || cpu.execution_failed() || caller->is_finished()
-					|| (scheduler && scheduler->stopped());
-			});
-			if (emu->irql(cpu) != passive_level || caller->kernel_apc_disable().read() != disabled
-				|| caller->special_apc_disable().read() != special_before)
-				fail_thread_notify(cpu, "image callback returned with unbalanced IRQL/APC context");
+			call_lifecycle(cpu, registration->routine, args, 1);
 			restore();
 		}
 		catch (...)
@@ -393,13 +455,205 @@ void win_kernel_state::notify_image(vcpu& cpu, const std::string_view path,
 			if (scheduler) scheduler->stop();
 			cpu.stop();
 			restore();
-			THREAD_LOG_INFO("image notify: restored irql={}, kernel_apc_disable={}, special_apc_disable={}",
-				emu->irql(cpu), caller->kernel_apc_disable().read(), caller->special_apc_disable().read());
 			throw;
 		}
 		--win::image_callback_depth;
 		image_notify.release(registration, cpu.id());
 	}
+}
+
+void win_kernel_state::unpublish_process(windows_process& target)
+{
+	{
+		std::unique_lock lock(proc_mtx_);
+		processes.erase(target.id());
+	}
+	if (target.eprocess() && active_process_list.address())
+	{
+		std::scoped_lock lock(list_mtx_);
+		active_process_list.remove(target.eprocess().address());
+	}
+	if (const auto handle = std::exchange(target.owned_console, 0))
+		sys_proc->handle_table().close_handle(handle);
+	LOG_INFO("process lifecycle unpublish: pid={} state={}", target.id(),
+		target.lifecycle == process_lifecycle::rejected ? "rejected" : target.lifecycle == process_lifecycle::exiting ? "exiting" : "setup-failed");
+}
+
+NTSTATUS win_kernel_state::notify_process(vcpu& cpu, windows_process& target, const bool create)
+{
+	const auto snapshot = process_notify.snapshot();
+	if (snapshot.empty()) return STATUS_SUCCESS;
+	// Native 64-bit PS_CREATE_NOTIFY_INFO; padding is explicit on both targets.
+	struct create_info
+	{
+		std::uint64_t size = 72;
+		std::uint32_t flags = 0, padding = 0;
+		addr_t parent = 0, creator_process = 0, creator_thread = 0;
+		addr_t file = 0, image = 0, command = 0;
+		NTSTATUS status = STATUS_SUCCESS;
+		std::uint32_t tail = 0;
+		bool operator==(const create_info&) const = default;
+	};
+	static_assert(sizeof(create_info) == 72);
+	const auto caller = cpu.thread();
+	if (!caller) fail_thread_notify(cpu, "process notification has no creator/exit thread");
+	const auto name = widen_string(target.image_path.substr(0, 32766));
+	const auto bytes = (name.size() + 1) * sizeof(char16_t);
+	const pool_block scratch(pool, sizeof(create_info) + 2 * sizeof(_UNICODE_STRING) + 2 * bytes,
+		pool_tag("PsNt"));
+	if (!scratch.addr()) fail_thread_notify(cpu, "process notification allocation failed");
+	auto& space = *cpu.curr_addr_space();
+	const auto us_addr = scratch.addr() + sizeof(create_info);
+	const auto buffer = us_addr + 2 * sizeof(_UNICODE_STRING);
+	_UNICODE_STRING us{};
+	us.Length = static_cast<unsigned short>(bytes - sizeof(char16_t));
+	us.MaximumLength = static_cast<unsigned short>(bytes);
+	us.Buffer = guest_ptr<char16_t>(buffer);
+	auto command = us;
+	command.Buffer = guest_ptr<char16_t>(buffer + bytes);
+	space.write_mem(us_addr, us);
+	space.write_mem(us_addr + sizeof(us), command);
+	space.write_mem(buffer, name.c_str(), bytes);
+	space.write_mem(buffer + bytes, name.c_str(), bytes);
+	// The filesystem resolves aliases and case, not canonical NT device paths.
+	// Leave FileOpenNameAvailable clear rather than claiming an exact name.
+	create_info expected;
+	expected.parent = target.parent_pid;
+	expected.creator_process = caller->proc()->id();
+	expected.creator_thread = caller->id();
+	expected.file = target.image_file_object;
+	expected.image = us_addr;
+	expected.command = us_addr + sizeof(us);
+	NTSTATUS status = STATUS_SUCCESS;
+	// Emulator convention: finish Ex admission before publishing classic creation.
+	for (const auto kind : {win::process_notify_kind::extended, win::process_notify_kind::classic})
+	{
+		if (create && kind == win::process_notify_kind::classic && (status & 0x80000000u)) break;
+		for (const auto& registration : snapshot)
+		{
+			if (registration->kind != kind || !process_notify.acquire(registration, cpu.id())) continue;
+			try
+			{
+				expected.status = status;
+				space.write_mem(scratch.addr(), expected);
+				const std::uint64_t classic[] = {target.parent_pid, target.id(), create ? 1u : 0u};
+				const std::uint64_t extended[] = {target.eprocess().address(), target.id(), create ? scratch.addr() : 0};
+                THREAD_LOG_INFO("process notify BEGIN: kind={} api={} routine=0x{:X} subjectPID={} creatorPID={} creatorTID={} CreationStatus=0x{:08X}",
+                    create ? "create" : "exit", kind == win::process_notify_kind::extended ? "Ex" : "classic",
+                    registration->routine, target.id(), caller->proc()->id(), caller->id(), status);
+				call_lifecycle(cpu, registration->routine,
+					kind == win::process_notify_kind::classic ? std::span<const std::uint64_t>(classic)
+					: std::span<const std::uint64_t>(extended), 2);
+				if (create && kind == win::process_notify_kind::extended)
+				{
+					auto returned = space.read_mem<create_info>(scratch.addr());
+					const auto candidate = returned.status;
+					returned.status = expected.status;
+					const auto image_us = space.read_mem<_UNICODE_STRING>(us_addr);
+					const auto command_us = space.read_mem<_UNICODE_STRING>(us_addr + sizeof(us));
+					std::vector<char16_t> text(name.size() + 1), cmd(name.size() + 1);
+					space.read_mem(buffer, text.data(), bytes);
+					space.read_mem(buffer + bytes, cmd.data(), bytes);
+					if (returned != expected || std::memcmp(&image_us, &us, sizeof(us))
+						|| std::memcmp(&command_us, &command, sizeof(command))
+						|| std::memcmp(text.data(), name.c_str(), bytes) || std::memcmp(cmd.data(), name.c_str(), bytes))
+						fail_thread_notify(cpu, "process callback rewrote immutable creation metadata");
+					if (!(status & 0x80000000u)) status = candidate;
+				}
+                THREAD_LOG_INFO("process notify END: kind={} api={} routine=0x{:X} subjectPID={} creatorPID={} creatorTID={} CreationStatus=0x{:08X}",
+                    create ? "create" : "exit", kind == win::process_notify_kind::extended ? "Ex" : "classic",
+                    registration->routine, target.id(), caller->proc()->id(), caller->id(), status);
+			}
+			catch (...) { process_notify.release(registration, cpu.id()); throw; }
+			process_notify.release(registration, cpu.id());
+		}
+	}
+	return status;
+}
+
+windows_emulator::user_process_args windows_emulator::create_user_process(vcpu& cpu,
+	const std::string_view exe_name)
+{
+	if (kernel_.in_lifecycle_callback(cpu.id()))
+		kernel_.fail_thread_notify(cpu, "reentrant process creation inside lifecycle callback");
+	if (!cpu.thread()) kernel_.fail_thread_notify(cpu, "process creation requires a creator thread");
+	user_process_args result;
+	// Resolve in the guest filesystem before constructing the PEB/parameters.
+	std::string path;
+	std::shared_ptr<win_file> file;
+	for (const auto& candidate : {std::string(exe_name), std::string(system32_dir_narrow) + std::string(exe_name),
+		std::string(drivers_dir_narrow) + std::string(exe_name), std::string(root_dir_narrow) + std::string(exe_name)})
+		if ((file = kernel_.fs.open(candidate))) { path = candidate; break; }
+	if (!file) { result.status = STATUS_OBJECT_NAME_NOT_FOUND; return result; }
+	std::shared_ptr<win_user_proc> proc;
+	std::shared_ptr<thread> initial;
+	auto rollback = [&] {
+		if (!proc) return;
+		proc->lifecycle = process_lifecycle::rejected;
+		if (initial)
+		{
+			initial->finish();
+			proc->terminate_thread(initial->id());
+		}
+		kernel_.unpublish_process(*proc);
+	};
+	try
+	{
+		proc = std::dynamic_pointer_cast<win_user_proc>(kernel_.create_process(path));
+		if (!proc) { result.status = STATUS_INSUFFICIENT_RESOURCES; return result; }
+		proc->lifecycle = process_lifecycle::preparing;
+		proc->parent_pid = cpu.thread()->proc()->id();
+		proc->image_path = path;
+		proc->set_scheduler(&scheduler_);
+		const auto ntdll = proc->find_module(ntdll_name);
+		const auto image = krnl::map_img(*proc, path.substr(path.find_last_of("\\/") + 1), file->data(), false, true);
+		const auto ldr_init = ntdll ? ntdll->find_symbol(loader_thread_startup) : std::nullopt;
+		if (!ntdll || !image || !ldr_init)
+		{ result.status = STATUS_INVALID_IMAGE_FORMAT; rollback(); return result; }
+		proc->set_image_base(image->addr);
+		if (!proc->eprocess()) { result.status = STATUS_NOT_SUPPORTED; rollback(); return result; }
+		{
+			std::scoped_lock lock(kernel_.list_mtx_);
+			auto ep = proc->eprocess().read();
+			ep.SectionBaseAddress = guest_ptr(image->addr);
+			ep.InheritedFromUniqueProcessId = guest_ptr(proc->parent_pid);
+			ep.ExitStatus = STATUS_PENDING;
+			ep.CreateTime.QuadPart = win_system_time();
+			ep.Pcb.Header.Type = ProcessObject;
+			ep.Pcb.Header.SignalState = 0;
+			auto process_object = proc->eprocess();
+			process_object.write(ep);
+		}
+		auto host = std::make_shared<file_host>();
+		host->file = file;
+		host->path = path;
+		_FILE_OBJECT body{};
+		body.Type = 5;
+		body.Size = sizeof(body);
+		body.FileName = win::init_unicode_string(*emu_->default_addr_space(), widen_string(path), prot_rw | prot_supervisor);
+		proc->image_file_object = kernel_.objs.create_object(0, &body, sizeof(body), host, prot_rw | prot_supervisor);
+		host->file_object = proc->image_file_object;
+		if (!proc->image_file_object) { result.status = STATUS_INSUFFICIENT_RESOURCES; rollback(); return result; }
+		initial = proc->create_suspended_thread(cpu, *ldr_init);
+		if (!initial) { result.status = STATUS_INSUFFICIENT_RESOURCES; rollback(); return result; }
+		setup_loader_frame(*initial, cpu, image->entry_point, ntdll->addr, 0);
+		result.status = kernel_.notify_process(cpu, *proc, true);
+		if (result.status & 0x80000000u)
+		{
+			result.admission_vetoed = true;
+			LOG_INFO("process {} rejected, status=0x{:08X}", exe_name, result.status);
+			rollback();
+			return result;
+		}
+		proc->lifecycle = process_lifecycle::live;
+		kernel_.notify_thread(cpu, *std::dynamic_pointer_cast<win_thread>(initial), true);
+		kernel_.notify_image(cpu, path, image->addr, image->size, proc->id());
+		kernel_.notify_image(cpu, std::string(system32_dir_narrow) + std::string(ntdll_name), ntdll->addr, ntdll->size, proc->id());
+		initial->start();
+		LOG_INFO("user process {} (pid={}): image at 0x{:X}, entry 0x{:X}", exe_name, proc->id(), image->addr, image->entry_point);
+		return {proc, image, initial, result.status};
+	}
+	catch (...) { rollback(); throw; }
 }
 
 void win_kernel_state::finish_thread(vcpu& cpu, const NTSTATUS status)
@@ -408,11 +662,56 @@ void win_kernel_state::finish_thread(vcpu& cpu, const NTSTATUS status)
 	if (!t) return;
 	if (in_lifecycle_callback(cpu.id()))
 		fail_thread_notify(cpu, "a thread cannot terminate inside a lifecycle callback");
-	if (t->is_finished() || t->exit_notification_started) return;
-	t->set_exit_status(status);
-	t->exit_notification_started = true;
+	const auto proc = std::dynamic_pointer_cast<windows_process>(t->proc());
+	{
+		std::scoped_lock lock(proc->lifecycle_mutex);
+		if (t->is_finished() || t->exit_notification_started) return;
+		t->set_exit_status(status);
+		t->exit_notification_started = true;
+		++proc->exit_callbacks;
+	}
 	try { notify_thread(cpu, *t, false); }
 	catch (...) { fail_thread_notify(cpu, "exit callback failed before thread completion"); }
+	bool process_exit = false;
+	{
+		std::scoped_lock lock(proc->lifecycle_mutex);
+		--proc->exit_callbacks;
+		bool other_live = false;
+		proc->for_each_thread([&](win_thread& other) {
+			if (other.id() != t->id() && !other.is_finished() && !other.exit_notification_started)
+				other_live = true;
+		});
+		if (!other_live && !proc->exit_callbacks && proc->lifecycle == process_lifecycle::live)
+		{
+			proc->lifecycle = process_lifecycle::exiting;
+			process_exit = true;
+		}
+	}
+	if (process_exit)
+	{
+		{
+			std::scoped_lock lock(list_mtx_);
+			auto ep = proc->eprocess().read();
+			ep.ExitStatus = status;
+			ep.ExitTime.QuadPart = win_system_time();
+			ep.ProcessExiting = 1;
+			ep.ProcessDelete = 1;
+			auto process_object = proc->eprocess();
+			process_object.write(ep);
+		}
+		notify_process(cpu, *proc, false);
+		win::set_state_at(*proc->eprocess().space(), proc->eprocess().address(), 1);
+		std::vector<std::shared_ptr<windows_process>> waiters;
+		{
+			std::shared_lock lock(proc_mtx_);
+			for (const auto& [id, p] : processes)
+				if (auto wp = std::dynamic_pointer_cast<windows_process>(p)) waiters.push_back(std::move(wp));
+		}
+		for (const auto& wp : waiters)
+			wp->wake_waiters(*proc->eprocess().space(), proc->eprocess().address());
+		unpublish_process(*proc);
+		proc->lifecycle = process_lifecycle::exited;
+	}
 	t->finish();
 }
 
@@ -436,6 +735,8 @@ std::shared_ptr<thread> windows_process::create_suspended_thread(vcpu& cpu,
 	const addr_t start_addr, const std::span<const std::uint64_t> args,
 	const std::size_t stack_size)
 {
+	if (emulator_ && emulator_->kernel().process_notify.in_callback(cpu.id()))
+		emulator_->kernel().fail_thread_notify(cpu, "thread creation inside process callback");
 	const auto id = static_cast<thread_id_type>(objs_.allocate_id());
 	const auto size = thread_stack_size(stack_size);
 
@@ -470,25 +771,36 @@ std::shared_ptr<thread> win_user_proc::create_suspended_thread(vcpu& cpu,
 	const addr_t start_addr, const std::span<const std::uint64_t> args,
 	const std::size_t stack_size)
 {
+	if (emulator_->kernel().process_notify.in_callback(cpu.id()))
+		emulator_->kernel().fail_thread_notify(cpu, "thread creation inside process callback");
+	std::unique_lock lifecycle_lock(lifecycle_mutex);
+	if (lifecycle == process_lifecycle::exiting || lifecycle == process_lifecycle::exited || lifecycle == process_lifecycle::rejected)
+		return {};
 	const auto id = static_cast<thread_id_type>(objs_.allocate_id());
 	const auto size = thread_stack_size(stack_size);
-
 	const addr_t stack_base = mem_.alloc(size, prot_rw);
+	if (!stack_base) return {};
 	auto self = std::static_pointer_cast<windows_process>(shared_from_this());
-	auto t = std::make_shared<win_user_thread>(
-		id, std::move(self), mem_, start_addr, stack_base, size, cpu);
-
+	auto t = std::make_shared<win_user_thread>(id, std::move(self), mem_, start_addr, stack_base, size, cpu);
 	t->set_emulator(emulator_);
-	setup_ethread(t, start_addr);
-
-	emulator_->init_thread_teb(*t, cpu, t->teb().address());
-
+	try
 	{
-		std::unique_lock lock(thread_mtx_);
-		threads_[t->id()] = t;
+		setup_ethread(t, start_addr);
+		if (!t->ethread()) throw std::runtime_error("initial ETHREAD allocation failed");
+		emulator_->init_thread_teb(*t, cpu, t->teb().address());
+		{
+			std::unique_lock lock(thread_mtx_);
+			threads_[t->id()] = t;
+		}
+		scheduler_->enqueue(cpu, t, args);
 	}
-
-	scheduler_->enqueue(cpu, t, args);
+	catch (...)
+	{
+		t->finish();
+		destroy_ethread(*t);
+		process::terminate_thread(t->id());
+		throw;
+	}
 	return t;
 }
 

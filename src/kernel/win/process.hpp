@@ -22,9 +22,21 @@ constexpr std::string_view user_exception_dispatcher = "KiUserExceptionDispatche
 
 constexpr std::string_view ntdll_name = "ntdll.dll";
 
+namespace win { inline thread_local unsigned process_callback_depth = 0; }
+
+enum class process_lifecycle { seeded, preparing, live, exiting, exited, rejected };
+
 class windows_process : public process
 {
 public:
+	std::atomic<process_lifecycle> lifecycle{process_lifecycle::seeded};
+	std::mutex lifecycle_mutex;
+	std::size_t exit_callbacks = 0;
+	win_handle_table::handle_t owned_console = 0;
+	addr_t image_file_object = 0;
+	process::id_type parent_pid = 0;
+	std::string image_path;
+
 	windows_process(id_type id, std::shared_ptr<struct addr_space> space,
 		win_obj_manager& objs, const win_filesystem& fs)
 		:	process(id, std::move(space)), objs_(objs), handle_table_(objs), fs_(fs) {}
