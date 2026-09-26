@@ -58,6 +58,7 @@ struct section_host final : win_object
 	std::string path;
 	std::uint64_t size = 0;
 	bool is_image = false;
+	std::uint32_t allocation_attributes = 0;
 
 	// An image section's view is the file laid out at its virtual addresses, not the file as it
 	// sits on disk, so it is built once here and copied from. Empty for anything else.
@@ -74,6 +75,7 @@ struct dispatcher_host final : win_object
 };
 
 inline constexpr std::uint32_t sec_image = 0x01000000;
+inline constexpr std::uint32_t sec_image_no_execute = 0x11000000;
 
 // Opaque to the guest apart from its size, which sits where the real one keeps it.
 inline constexpr std::size_t section_body_size = 0x40;

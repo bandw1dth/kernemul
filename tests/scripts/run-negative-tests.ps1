@@ -1,8 +1,8 @@
 #Requires -Version 7.0
 param(
     [string]$Executable = 'build-x64-whp\Release\kernemul.exe',
-    [ValidateSet('callback_failure_delay', 'callback_failure_wait', 'core_failure_unsupported_dpc', 'core_failure_nested_dpc', 'thread_notify_failure_delay', 'thread_notify_failure_remove', 'thread_notify_failure_api', 'thread_notify_failure_suspend')]
-    [string[]]$Driver = @('callback_failure_delay', 'callback_failure_wait', 'core_failure_unsupported_dpc', 'core_failure_nested_dpc', 'thread_notify_failure_delay', 'thread_notify_failure_remove', 'thread_notify_failure_api', 'thread_notify_failure_suspend'),
+    [ValidateSet('callback_failure_delay', 'callback_failure_wait', 'core_failure_unsupported_dpc', 'core_failure_nested_dpc', 'thread_notify_failure_delay', 'thread_notify_failure_remove', 'thread_notify_failure_api', 'thread_notify_failure_suspend', 'image_notify_failure_delay', 'image_notify_failure_remove', 'image_notify_failure_api', 'image_notify_failure_exit', 'image_noexecute_enforcement')]
+    [string[]]$Driver = @('callback_failure_delay', 'callback_failure_wait', 'core_failure_unsupported_dpc', 'core_failure_nested_dpc', 'thread_notify_failure_delay', 'thread_notify_failure_remove', 'thread_notify_failure_api', 'thread_notify_failure_suspend', 'image_notify_failure_delay', 'image_notify_failure_remove', 'image_notify_failure_api', 'image_notify_failure_exit', 'image_noexecute_enforcement'),
     [ValidateRange(1, 30)][int]$TimeoutSeconds = 25
 )
 $ErrorActionPreference = 'Stop'
@@ -25,7 +25,26 @@ foreach ($name in $Driver) {
     $log = [string](Get-Content -LiteralPath $out -Raw)
     $errorLog = [string](Get-Content -LiteralPath $err -Raw)
     $required = [ordered]@{}
-    if ($name -like 'thread_notify_failure_*') {
+    if ($name -eq 'image_noexecute_enforcement') {
+        $required.control = 'DbgPrint: IMAGE_NOEXECUTE CONTROL_EXECUTED'
+        $required.readable = 'DbgPrint: IMAGE_NOEXECUTE READABLE_MZ=5a4d'
+        $required.reprotect = 'DbgPrint: IMAGE_NOEXECUTE REPROTECT_REJECTED'
+        $required.preExecute = 'DbgPrint: IMAGE_NOEXECUTE PRE_EXECUTE'
+        $required.accessViolation = 'exception dispatch: code=0xC0000005'
+        $required.unhandledFault = 'unhandled page fault on cpu 0'
+        $forbiddenPattern = 'FORBIDDEN_|SETUP_FAILED'
+    } elseif ($name -like 'image_notify_failure_*') {
+        $required.preMap = 'DbgPrint: IMAGE_NOTIFY_FAILURE PRE_MAP'
+        $required.callbackBegin = 'DbgPrint: IMAGE_NOTIFY_FAILURE PRE_FAULT'
+        $required.restoredContext = 'image notify: restored irql=0, kernel_apc_disable=0, special_apc_disable=0'
+        switch ($name) {
+            'image_notify_failure_delay' { $required.diagnostic='ntoskrnl\.exe!KeDelayExecutionThread faulted: image callback cannot begin a wait' }
+            'image_notify_failure_remove' { $required.diagnostic='thread notify: PsRemoveLoadImageNotifyRoutine: callback rundown deadlock' }
+            'image_notify_failure_api' { $required.diagnostic='ntoskrnl\.exe!KeSetTimerEx faulted: negative KeSetTimerEx period' }
+            'image_notify_failure_exit' { $required.diagnostic='thread notify: a thread cannot terminate inside a lifecycle callback' }
+        }
+        $forbiddenPattern = 'FORBIDDEN_|SETUP_FAILED|CONFORMANCE FAIL'
+    } elseif ($name -like 'thread_notify_failure_*') {
         $kind = $name.Substring('thread_notify_failure_'.Length).ToUpperInvariant()
         $tag = "THREAD_NOTIFY_$kind"
         $required.preCreate = "DbgPrint: $tag PRE_CREATE"

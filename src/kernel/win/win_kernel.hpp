@@ -13,6 +13,7 @@
 #include "ethread.hpp"
 #include "thread.hpp"
 #include "thread_notify.hpp"
+#include "section_views.hpp"
 #include "driver.hpp"
 #include "irp.hpp"
 #include "mdl.hpp"
@@ -54,6 +55,11 @@ struct win_kernel_state : kernel_state
 	// One per machine: the trampoline it returns through is a single address.
 	guest_caller calls;
 	win::thread_notify_registry thread_notify;
+	// Modern Windows supports up to 64 load-image registrations per instance.
+	win::lifecycle_notify_registry image_notify{64};
+	bool in_lifecycle_callback(std::size_t cpu) const
+	{ return thread_notify.in_callback(cpu) || image_notify.in_callback(cpu); }
+	void notify_image(vcpu& cpu, std::string_view path, addr_t base, std::uint64_t size);
 	void notify_thread(vcpu& cpu, const win_thread& target, bool create);
 	void finish_thread(vcpu& cpu, NTSTATUS status);
 	[[noreturn]] void fail_thread_notify(vcpu& cpu, const char* reason);
@@ -76,7 +82,8 @@ struct win_kernel_state : kernel_state
 	void update_time();
 	NTSTATUS delay_thread(vcpu& cpu, std::int64_t due);
 
-	std::unordered_map<addr_t, std::uint64_t> views;
+	win::section_views views;
+	win::section_views system_views; // Mm system-space views are not process section views.
 
 	std::int64_t boot_time = static_cast<std::int64_t>(clock.sample().system_time);
 

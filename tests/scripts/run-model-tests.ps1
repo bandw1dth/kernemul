@@ -1,4 +1,4 @@
-param([string]$SdkVersion = '10.0.28000.0')
+param([string]$SdkVersion = '10.0.28000.0', [string]$BuildDirectory = 'build-x64-whp')
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
@@ -14,7 +14,13 @@ if (-not $sources.Count) { throw 'No model tests found.' }
 foreach ($source in $sources) {
     $exe = Join-Path $out ($source.BaseName + '.exe')
     $obj = Join-Path $out ($source.BaseName + '.obj')
-    & "$vc\bin\Hostx64\x64\cl.exe" /nologo /std:c++latest /EHsc /W4 /MT "/I$root\src" "/I$vc\include" "/I$sdk\Include\$SdkVersion\ucrt" "/I$sdk\Include\$SdkVersion\um" "/I$sdk\Include\$SdkVersion\shared" "/Fo$obj" "/Fe$exe" $source.FullName /link "/LIBPATH:$vc\lib\x64" "/LIBPATH:$sdk\Lib\$SdkVersion\ucrt\x64" "/LIBPATH:$sdk\Lib\$SdkVersion\um\x64"
+    $extra = @()
+    if ($source.BaseName -eq 'win_user_mem_model') {
+        # Compile the actual allocator, using the configured build's logging headers.
+        $extra = @("$root\src\kernel\win\win_user_mem.cpp", "/I$root\$BuildDirectory\vcpkg_installed\x64-windows\include", '/DSPDLOG_USE_STD_FORMAT', '/Zc:preprocessor')
+        $obj = "$out\"
+    }
+    & "$vc\bin\Hostx64\x64\cl.exe" /nologo /std:c++latest /EHsc /W4 /MT "/I$root\src" "/I$root\vendor\pe\src" "/I$vc\include" "/I$sdk\Include\$SdkVersion\ucrt" "/I$sdk\Include\$SdkVersion\um" "/I$sdk\Include\$SdkVersion\shared" "/Fo$obj" "/Fe$exe" $source.FullName @extra /link "/LIBPATH:$vc\lib\x64" "/LIBPATH:$sdk\Lib\$SdkVersion\ucrt\x64" "/LIBPATH:$sdk\Lib\$SdkVersion\um\x64"
     if ($LASTEXITCODE) { throw "Compile failed: $($source.Name)" }
     & $exe
     if ($LASTEXITCODE) { throw "Test failed: $($source.Name)" }

@@ -725,7 +725,7 @@ void modules::register_ntoskrnl_task_ops(win_kernel_state& state, proc_module& m
 			return STATUS_INVALID_HANDLE;
 		}
 
-		if (t == cpu.thread() && st->thread_notify.in_callback(cpu.id()))
+		if (t == cpu.thread() && st->in_lifecycle_callback(cpu.id()))
 			st->fail_thread_notify(cpu, "NtSuspendThread: self-suspension inside a lifecycle callback is unsupported");
 
 		const auto previous = t->suspend();

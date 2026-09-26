@@ -2,6 +2,7 @@
 #include "../../util/log.hpp"
 
 #include <algorithm>
+#include <limits>
 
 bool win_user_mem::is_resident(const std::uint32_t prot)
 {
@@ -157,10 +158,10 @@ void win_user_mem::evict_pages(const addr_t base, const std::size_t size)
 
 void win_user_mem::release_pages(const addr_t base, const std::size_t size)
 {
+	space_->mmu_->unmap_virt(*space_, base, size);
+
 	for (std::size_t off = 0; off < size; off += page_size())
 		backing_.erase(base + off);
-
-	space_->mmu_->unmap_virt(*space_, base, size);
 }
 
 void win_user_mem::commit_pages(const addr_t base, const std::size_t size, const std::uint32_t prot)
@@ -216,6 +217,8 @@ addr_t win_user_mem::pick_base(const std::size_t size, const std::size_t alignme
 NTSTATUS win_user_mem::commit_into(const reservation_map::iterator res, const addr_t base,
 	const std::size_t size, const std::uint32_t prot)
 {
+	if ((to_mem_prot(prot) & prot_exec) && execution_blocked(base, size))
+		return STATUS_SECTION_PROTECTION;
 	const auto end = base + size;
 
 	if (end > res->first + res->second.size)
@@ -266,7 +269,11 @@ NTSTATUS win_user_mem::allocate(addr_t& base, std::size_t& size, const std::uint
 	std::scoped_lock lock(mtx_);
 
 	const auto start = page_align(base);
+	if (!size || size > std::numeric_limits<std::size_t>::max() - (base - start) - (page_size() - 1))
+		return STATUS_INVALID_PARAMETER;
 	const auto region = size_align(size + (base - start));
+	if (region > std::numeric_limits<addr_t>::max() - start)
+		return STATUS_INVALID_PARAMETER;
 
 	if (!region)
 		return STATUS_INVALID_PARAMETER;
@@ -315,8 +322,19 @@ NTSTATUS win_user_mem::allocate(addr_t& base, std::size_t& size, const std::uint
 
 	if (do_commit)
 	{
-		commit_pages(target, region, prot);
-		res.committed[target] = committed_region{ .size = region, .prot = prot };
+		try
+		{
+			commit_pages(target, region, prot);
+			res.committed[target] = committed_region{ .size = region, .prot = prot };
+		}
+		catch (...)
+		{
+			// The caller has not received target yet, so it cannot roll this back.
+			// A failed MMU operation may already have mapped part of the range.
+			release_pages(target, region);
+			reservations_.erase(target);
+			throw;
+		}
 	}
 
 	base = target;
@@ -395,14 +413,42 @@ NTSTATUS win_user_mem::free(addr_t& base, std::size_t& size, const std::uint32_t
 	return STATUS_SUCCESS;
 }
 
+NTSTATUS win_user_mem::release_view(const addr_t base)
+{
+	std::scoped_lock lock(mtx_);
+	const auto res = reservations_.find(base);
+	if (res == reservations_.end()) return STATUS_UNABLE_TO_FREE_VM;
+	// Release the entire reservation, including nonresident guard/noaccess backing
+	// and pages allocated before image bookkeeping could finish.
+	release_pages(res->first, res->second.size);
+	reservations_.erase(res);
+	return STATUS_SUCCESS;
+}
+
+bool win_user_mem::execution_blocked(const addr_t base, const std::size_t size) const
+{
+	if (!size) return false;
+	for (const auto& [start, res] : reservations_)
+		if (res.no_execute && res.size && (base <= start ? start - base < size : base - start < res.size))
+			return true;
+	return false;
+}
+
 NTSTATUS win_user_mem::protect(addr_t& base, std::size_t& size, const std::uint32_t new_prot,
 	std::uint32_t& old_prot)
 {
 	std::scoped_lock lock(mtx_);
 
 	const auto start = page_align(base);
+	if (!size || size > std::numeric_limits<std::size_t>::max() - (base - start) - (page_size() - 1))
+		return STATUS_INVALID_PARAMETER;
 	const auto region = size_align(size + (base - start));
+	if (region > std::numeric_limits<addr_t>::max() - start)
+		return STATUS_INVALID_PARAMETER;
 	const auto end = start + region;
+
+	if ((to_mem_prot(new_prot) & prot_exec) && execution_blocked(start, region))
+		return STATUS_SECTION_PROTECTION;
 
 	old_prot = win::page_readwrite;
 
@@ -517,7 +563,15 @@ addr_t win_user_mem::alloc(const std::size_t size, const mem_prot prot)
 	return alloc_pages(size, to_win_prot(prot));
 }
 
-void win_user_mem::register_image(const addr_t base, const std::size_t size)
+void win_user_mem::register_section_view(const addr_t base, const std::size_t size,
+	const bool is_image, const std::uint32_t prot, const bool no_execute)
+{
+	if (is_image) register_image(base, size, prot, no_execute);
+	else register_mapped(base, size, prot);
+}
+
+void win_user_mem::register_image(const addr_t base, const std::size_t size, const std::uint32_t prot,
+	const bool no_execute)
 {
 	std::scoped_lock lock(mtx_);
 
@@ -525,10 +579,11 @@ void win_user_mem::register_image(const addr_t base, const std::size_t size)
 
 	auto& res = reservations_[base];
 	res.size = region;
-	res.initial_prot = win::page_execute_readwrite;
+	res.initial_prot = prot;
 	res.type = win::mem_image;
+	res.no_execute = no_execute;
 	res.committed.clear();
-	res.committed[base] = committed_region{ .size = region, .prot = win::page_execute_readwrite };
+	res.committed[base] = committed_region{ .size = region, .prot = prot };
 
 	LOG_INFO("win_user_mem: registered image 0x{:X}+0x{:X}", base, region);
 }

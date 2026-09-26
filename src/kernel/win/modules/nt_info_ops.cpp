@@ -110,6 +110,13 @@ void modules::register_ntoskrnl_info_ops(win_kernel_state& state, proc_module& m
 			return number;
 		});
 
+	state.redirect(mod, "KeAreApcsDisabled", [](vcpu& cpu) -> bool
+	{
+		const auto t = std::dynamic_pointer_cast<win_thread>(cpu.thread());
+		return t && t->ethread() && (t->kernel_apc_disable().read() != 0
+			|| t->special_apc_disable().read() != 0);
+	});
+
 	// Interrupts are the third term on real Windows, never masked here, so that term is dropped.
 	state.redirect(mod, "KeAreAllApcsDisabled", [st](vcpu& cpu) -> bool
 	{

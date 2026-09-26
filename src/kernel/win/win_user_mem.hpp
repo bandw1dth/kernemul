@@ -63,6 +63,9 @@ public:
 	NTSTATUS allocate(addr_t& base, std::size_t& size, std::uint32_t alloc_type,
 		std::uint32_t prot, std::size_t alignment = 0);
 	NTSTATUS free(addr_t& base, std::size_t& size, std::uint32_t free_type);
+	// Host mapping lifecycle only: unlike NtFreeVirtualMemory, a section teardown
+	// may release an image/mapped reservation (or a private allocation before commit).
+	NTSTATUS release_view(addr_t base);
 	NTSTATUS protect(addr_t& base, std::size_t& size, std::uint32_t new_prot,
 		std::uint32_t& old_prot);
 	NTSTATUS query(addr_t addr, win::memory_basic_info& info) const;
@@ -83,8 +86,12 @@ public:
 	template <typename T>
 	void write_mem(addr_t va, const T& val) { space_->write_mem<T>(va, val); }
 
-	void register_image(addr_t base, std::size_t size);
+	void register_image(addr_t base, std::size_t size, std::uint32_t prot = win::page_execute_readwrite,
+		bool no_execute = false);
 	void register_mapped(addr_t base, std::size_t size, std::uint32_t prot);
+	// Classify every successfully materialized section before publishing its view.
+	void register_section_view(addr_t base, std::size_t size, bool is_image,
+		std::uint32_t prot, bool no_execute = false);
 
 	bool handle_fault(addr_t fault_addr);
 
@@ -100,6 +107,7 @@ private:
 		std::size_t size;
 		std::uint32_t initial_prot;
 		std::uint32_t type;
+		bool no_execute = false;
 		std::map<addr_t, committed_region> committed;
 	};
 
@@ -121,6 +129,7 @@ private:
 	void evict_pages(addr_t base, std::size_t size);
 	void release_pages(addr_t base, std::size_t size);
 	void commit_pages(addr_t base, std::size_t size, std::uint32_t prot);
+	bool execution_blocked(addr_t base, std::size_t size) const; // mtx_ held
 	void apply_prot(addr_t base, std::size_t size, std::uint32_t old_prot, std::uint32_t new_prot);
 
 	static committed_map::iterator find_committed(committed_map& committed, addr_t addr);

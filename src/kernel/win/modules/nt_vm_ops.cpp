@@ -5,11 +5,13 @@
 #include "../status.hpp"
 #include "../string.hpp"
 #include "../types.hpp"
+#include "../section_image.hpp"
 #include "../../../util/log.hpp"
 #include "../../../util/string.hpp"
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace
@@ -249,7 +251,7 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 			protect, "NtAllocateVirtualMemoryEx");
 	};
 
-	auto free_vm = [](vcpu& cpu, const std::uint64_t process_handle,
+	auto free_vm = [st](vcpu& cpu, const std::uint64_t process_handle,
 		emu_object<addr_t> base_address, emu_object<std::uint64_t> region_size,
 		const std::uint32_t free_type) -> NTSTATUS
 	{
@@ -261,6 +263,16 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 
 		const auto base = mdl_page_base(base_address.read());
 		auto size = region_size ? region_size.read() : 0;
+
+		if (free_type & (mem_release | win::mem_decommit))
+		{
+			if (size > std::numeric_limits<addr_t>::max() - base)
+				return STATUS_INVALID_PARAMETER;
+			// A zero-sized release/decommit still names the reservation at base.
+			// Only NtUnmapViewOfSection may remove a tracked section's backing.
+			if (cpu.thread() && st->views.overlaps(cpu.thread()->proc()->id(), base, size ? size : 1))
+				return STATUS_UNABLE_TO_FREE_VM;
+		}
 
 		if (auto* const mem = user_mem(cpu))
 		{
@@ -311,7 +323,7 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 		return STATUS_SUCCESS;
 	};
 
-	auto protect_vm = [](vcpu& cpu, const std::uint64_t process_handle,
+	auto protect_vm = [st](vcpu& cpu, const std::uint64_t process_handle,
 		emu_object<addr_t> base_address, emu_object<std::uint64_t> region_size,
 		const std::uint32_t new_protect, emu_object<std::uint32_t> old_protect) -> NTSTATUS
 	{
@@ -323,8 +335,18 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 
 		const auto requested = base_address.read();
 		const auto base = mdl_page_base(requested);
-		const auto size = (region_size.read() + (requested - base) + mdl_page_size - 1)
+		const auto requested_size = region_size.read();
+		const auto padding = (requested - base) + mdl_page_size - 1;
+		if (!requested_size || requested_size > std::numeric_limits<std::uint64_t>::max() - padding)
+			return STATUS_INVALID_PARAMETER;
+		const auto size = (requested_size + padding)
 			& ~static_cast<std::uint64_t>(mdl_page_size - 1);
+		if (size > std::numeric_limits<addr_t>::max() - base)
+			return STATUS_INVALID_PARAMETER;
+
+		if ((prot_from_page(new_protect) & prot_exec) && cpu.thread()
+			&& st->views.execution_blocked(cpu.thread()->proc()->id(), base, size))
+			return STATUS_SECTION_PROTECTION;
 
 		if (auto* const mem = user_mem(cpu))
 		{
@@ -528,6 +550,7 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 
 		auto host = std::make_shared<section_host>();
 		host->is_image = (allocation_attributes & sec_image) != 0;
+		host->allocation_attributes = allocation_attributes;
 
 		if (file_handle)
 		{
@@ -539,6 +562,12 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 			host->file = file->file;
 			host->path = file->path;
 		}
+
+		if (host->is_image && !host->file)
+			return STATUS_INVALID_FILE_FOR_SECTION;
+
+		if (host->is_image && host->file && !win::valid_section_image(host->file->data()))
+			return STATUS_INVALID_IMAGE_FORMAT;
 
 		if (host->file && host->file->size() == 0)
 			return STATUS_MAPPED_FILE_SIZE_ZERO;
@@ -645,7 +674,7 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 			return STATUS_INFO_LENGTH_MISMATCH;
 
 		section_basic_information_t info{};
-		info.allocation_attributes = host->is_image ? sec_image : 0;
+		info.allocation_attributes = host->allocation_attributes;
 		info.maximum_size = static_cast<std::int64_t>(host->size);
 
 		emu_object<section_basic_information_t>(*cpu.curr_addr_space(), section_information)
@@ -674,13 +703,23 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 			if (!host)
 				return STATUS_INVALID_HANDLE;
 
-			const auto offset = section_offset
-				? static_cast<std::uint64_t>(section_offset.read()) : 0;
+			if (!base_address || !view_size || !cpu.thread()) return STATUS_INVALID_PARAMETER;
+			addr_t old_base;
+			std::uint64_t old_size, offset;
+			try
+			{
+				old_base = base_address.read();
+				old_size = view_size.read();
+				offset = section_offset ? static_cast<std::uint64_t>(section_offset.read()) : 0;
+			}
+			catch (...) { return STATUS_ACCESS_VIOLATION; }
+			const auto owner = cpu.thread()->proc()->id();
+			const bool no_execute = (host->allocation_attributes & sec_image_no_execute) == sec_image_no_execute;
 
 			if (offset >= host->size)
 				return STATUS_INVALID_PARAMETER;
 
-			auto size = view_size ? view_size.read() : 0;
+			auto size = old_size;
 
 			if (!size)
 				size = host->size - offset;
@@ -696,7 +735,9 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 				if (!host->file)
 					return STATUS_INVALID_FILE_FOR_SECTION;
 
-				image = krnl::pe_virtual_image(host->file->data());
+				if (!win::valid_section_image(host->file->data())) return STATUS_INVALID_IMAGE_FORMAT;
+				try { image = krnl::pe_virtual_image(host->file->data()); }
+				catch (const std::bad_alloc&) { return STATUS_INSUFFICIENT_RESOURCES; }
 
 				if (image.empty())
 					return STATUS_INVALID_IMAGE_FORMAT;
@@ -704,6 +745,10 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 				if (offset)
 					return STATUS_INVALID_PARAMETER;
 
+				const auto machine = reinterpret_cast<const pe::image*>(image.data())->nt_hdrs()->file_hdr.machine;
+				const bool native = (machine == 0x8664 && target::name == "x64")
+					|| (machine == 0xAA64 && target::name == "arm64");
+				if (!native) return STATUS_NOT_SUPPORTED;
 				size = image.size();
 			}
 
@@ -718,55 +763,61 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 						->nt_hdrs()->optional_hdr.image_base);
 
 			addr_t base = 0;
-
-			if (mem)
-			{
-				if (preferred)
-				{
-					addr_t at = preferred;
-					auto region = static_cast<std::size_t>(size);
-
-					if (mem->allocate(at, region, mem_commit | mem_reserve,
-							page_execute_readwrite) == STATUS_SUCCESS && at == preferred)
-						base = at;
-				}
-
-				if (!base)
-					base = mem->alloc_pages(size, host->is_image
-						? page_execute_readwrite : win32_protect);
-			}
-			else
-			{
-				base = space.alloc(size, prot_from_page(win32_protect) | prot_supervisor);
-			}
-
-			if (!base)
-				return STATUS_INSUFFICIENT_RESOURCES;
-
-			if (!image.empty())
-			{
-				space.write_mem(base, image.data(), image.size());
-
+			const auto protection = host->is_image
+				? (no_execute ? page_readonly : page_execute_readwrite) : win32_protect;
+			bool tracked = false;
+			auto rollback = [&] {
+				if (tracked) st->views.remove(owner, base, [](auto) { return true; });
+				if (!base) return;
 				if (mem)
-					mem->register_image(base, size);
-			}
-			else if (host->file)
+				{
+					if (mem->release_view(base) != STATUS_SUCCESS)
+						throw std::runtime_error("section view rollback failed");
+				}
+				else
+					// Remove translations; the monotonic kernel allocator cannot reclaim backing.
+					space.mmu_->unmap_virt(space, base, size);
+			};
+			try
 			{
-				const auto data = host->file->data();
-				const auto available = data.size() > offset ? data.size() - offset : 0;
-				const auto copied = std::min<std::size_t>(size, available);
-
-				if (copied)
-					space.write_mem(base, data.data() + offset, copied);
-			}
-
-			if (base_address)
+				if (mem)
+				{
+					if (preferred)
+					{
+						addr_t at = preferred;
+						auto region = static_cast<std::size_t>(size);
+						if (mem->allocate(at, region, mem_commit | mem_reserve, protection) == STATUS_SUCCESS)
+							base = at;
+					}
+					if (!base) base = mem->alloc_pages(size, protection);
+				}
+				else base = space.alloc(size, prot_from_page(no_execute ? page_readonly : win32_protect) | prot_supervisor);
+				if (!base) return STATUS_INSUFFICIENT_RESOURCES;
+				if (!image.empty())
+				{
+					space.write_mem(base, image.data(), image.size());
+				}
+				else if (host->file)
+				{
+					const auto data = host->file->data();
+					const auto available = data.size() > offset ? data.size() - offset : 0;
+					const auto copied = std::min<std::size_t>(size, available);
+					if (copied) space.write_mem(base, data.data() + offset, copied);
+				}
+				if (mem) mem->register_section_view(base, size, host->is_image, protection, no_execute);
+				// Publish outputs and ownership before dispatch; no mapping lock crosses guest code.
 				base_address.write(base);
-
-			if (view_size)
 				view_size.write(size);
-
-			st->views[base] = size;
+				tracked = st->views.insert(owner, base, size, no_execute);
+				if (!tracked) throw std::runtime_error("duplicate section view");
+			}
+			catch (...)
+			{
+				rollback();
+				try { base_address.write(old_base); view_size.write(old_size); } catch (...) {}
+				return STATUS_ACCESS_VIOLATION;
+			}
+			if (host->is_image && !no_execute) st->notify_image(cpu, host->path, base, size);
 
 			const bool rebased = preferred && base != preferred;
 
@@ -784,22 +835,20 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 			if (!is_current_process(process_handle))
 				return STATUS_INVALID_HANDLE;
 
-			const auto it = st->views.find(base_address);
-
-			if (it == st->views.end())
-			{
-				THREAD_LOG_WARN("NtUnmapViewOfSection: 0x{:X} is not a mapped view", base_address);
-				return STATUS_INVALID_PARAMETER;
-			}
-
-			auto& space = *cpu.curr_addr_space();
-			space.mmu_->unmap_virt(space, base_address, it->second);
-
-			THREAD_LOG_INFO("NtUnmapViewOfSection(0x{:X}): {} bytes", base_address, it->second);
-
-			st->views.erase(it);
-
-			return STATUS_SUCCESS;
+			if (!cpu.thread()) return STATUS_INVALID_PARAMETER;
+			NTSTATUS status = STATUS_INVALID_PARAMETER;
+			st->views.remove(cpu.thread()->proc()->id(), base_address, [&](const auto size) {
+				auto& space = *cpu.curr_addr_space();
+				if (auto* mem = user_mem(cpu))
+				{
+					status = mem->release_view(base_address);
+					if (status != STATUS_SUCCESS) return false;
+				}
+				else space.mmu_->unmap_virt(space, base_address, size);
+				status = STATUS_SUCCESS;
+				return true;
+			});
+			return status;
 		});
 
 	state.redirect_ntzw(mod, "AllocateVirtualMemory", allocate_vm);

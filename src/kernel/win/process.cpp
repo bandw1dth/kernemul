@@ -59,11 +59,95 @@ void win_kernel_state::notify_thread(vcpu& cpu, const win_thread& target, const 
 	}
 }
 
+void win_kernel_state::notify_image(vcpu& cpu, const std::string_view path,
+	const addr_t base, const std::uint64_t size)
+{
+	const auto snapshot = image_notify.snapshot();
+	if (snapshot.empty()) return;
+	const auto caller = std::dynamic_pointer_cast<win_thread>(cpu.thread());
+	auto* const emu = emulator();
+	if (!caller || !caller->ethread() || !emu || cpu.in_dpc || emu->irql(cpu) != passive_level)
+		fail_thread_notify(cpu, "image callback requires a thread at PASSIVE_LEVEL");
+	// IMAGE_INFO, with no extended information, trust claims or driver-load flags.
+	struct image_info
+	{
+		std::uint32_t properties = 0, padding = 0;
+		std::uint64_t base = 0;
+		std::uint32_t selector = 0, padding2 = 0;
+		std::uint64_t size = 0;
+		std::uint32_t section = 0, padding3 = 0;
+	};
+	static_assert(sizeof(image_info) == 40);
+	// The pool reuses scratch after delivery, including exceptional exits. The
+	// UNICODE_STRING length is bounded by its 16-bit byte count.
+	const auto name = widen_string(path.substr(0, 32766));
+	const pool_block scratch(pool, sizeof(image_info) + sizeof(_UNICODE_STRING)
+		+ (name.size() + 1) * sizeof(char16_t), pool_tag("ImNt"));
+	if (!scratch.addr()) fail_thread_notify(cpu, "image notification scratch allocation failed");
+	auto& space = *cpu.curr_addr_space();
+	const auto info_address = scratch.addr();
+	const auto name_address = info_address + sizeof(image_info);
+	const auto buffer = name_address + sizeof(_UNICODE_STRING);
+	_UNICODE_STRING us{};
+	us.Length = static_cast<unsigned short>(name.size() * sizeof(char16_t));
+	us.MaximumLength = us.Length + sizeof(char16_t);
+	us.Buffer = guest_ptr<char16_t>(buffer);
+	space.write_mem(info_address, image_info{.base = base, .size = size});
+	space.write_mem(name_address, us);
+	space.write_mem(buffer, name.c_str(), us.MaximumLength);
+	const std::uint64_t args[] = {name_address, caller->proc()->id(), info_address};
+	const auto irql_before = emu->irql(cpu);
+	const auto kernel_before = caller->kernel_apc_disable().read();
+	const auto special_before = caller->special_apc_disable().read();
+	const auto sleep_before = caller->sleep_until();
+	const auto scheduler = sys_proc->scheduler();
+	if (kernel_before == std::numeric_limits<std::int16_t>::min())
+		fail_thread_notify(cpu, "image callback critical-region counter overflow");
+	const auto disabled = static_cast<std::int16_t>(kernel_before - 1);
+	auto restore = [&] {
+		emu->set_irql(cpu, irql_before);
+		caller->kernel_apc_disable().write(kernel_before);
+		caller->special_apc_disable().write(special_before);
+	};
+	for (const auto& registration : snapshot)
+	{
+		if (!image_notify.acquire(registration, cpu.id())) continue;
+		++win::image_callback_depth;
+		try
+		{
+			caller->kernel_apc_disable().write(disabled);
+			calls.call(cpu, registration->routine, args, 0, [&] {
+				if (caller->suspend_count() || caller->is_waiting() || caller->sleep_until() != sleep_before)
+					fail_thread_notify(cpu, "image callback cannot block or suspend");
+				return cpu.dpc_failed || cpu.execution_failed() || caller->is_finished()
+					|| (scheduler && scheduler->stopped());
+			});
+			if (emu->irql(cpu) != passive_level || caller->kernel_apc_disable().read() != disabled
+				|| caller->special_apc_disable().read() != special_before)
+				fail_thread_notify(cpu, "image callback returned with unbalanced IRQL/APC context");
+			restore();
+		}
+		catch (...)
+		{
+			--win::image_callback_depth;
+			image_notify.release(registration, cpu.id());
+			if (scheduler) scheduler->stop();
+			cpu.stop();
+			restore();
+			THREAD_LOG_INFO("image notify: restored irql={}, kernel_apc_disable={}, special_apc_disable={}",
+				emu->irql(cpu), caller->kernel_apc_disable().read(), caller->special_apc_disable().read());
+			throw;
+		}
+		--win::image_callback_depth;
+		image_notify.release(registration, cpu.id());
+	}
+}
+
 void win_kernel_state::finish_thread(vcpu& cpu, const NTSTATUS status)
 {
 	const auto t = std::dynamic_pointer_cast<win_thread>(cpu.thread());
 	if (!t) return;
-	if (thread_notify.in_callback(cpu.id()))
+	if (in_lifecycle_callback(cpu.id()))
 		fail_thread_notify(cpu, "a thread cannot terminate inside a lifecycle callback");
 	if (t->is_finished() || t->exit_notification_started) return;
 	t->set_exit_status(status);

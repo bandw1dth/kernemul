@@ -17,12 +17,10 @@ namespace
 struct notify_routines
 {
 	std::set<addr_t> process;
-	std::set<addr_t> image;
 };
 
 // What NT's fixed-size tables hold, and what a driver past the limit is told.
 constexpr std::size_t max_process_notify_routines = 64;
-constexpr std::size_t max_image_notify_routines = 8;
 
 NTSTATUS add_notify(std::set<addr_t>& routines, const std::size_t limit,
 	const std::string_view who, const addr_t routine)
@@ -407,24 +405,38 @@ void modules::register_ntoskrnl_process_ops(win_kernel_state& state, proc_module
 	state.redirect(mod, "PsRemoveCreateThreadNotifyRoutine",
 		[st](vcpu& cpu, const addr_t notify_routine) -> NTSTATUS
 		{
-			const auto result = st->thread_notify.remove(notify_routine, cpu.id());
+			const auto result = st->thread_notify.remove(notify_routine, cpu.id(), st->in_lifecycle_callback(cpu.id()));
 			if (result == win::thread_notify_registry::remove_result::callback_deadlock)
 				st->fail_thread_notify(cpu, "PsRemoveCreateThreadNotifyRoutine: self-removal or callback rundown deadlock");
 			return result == win::thread_notify_registry::remove_result::removed
 				? STATUS_SUCCESS : STATUS_PROCEDURE_NOT_FOUND;
 		});
 
-	state.redirect(mod, "PsSetLoadImageNotifyRoutine",
-		[notify](vcpu&, const addr_t notify_routine) -> NTSTATUS
-		{
-			return add_notify(notify->image, max_image_notify_routines,
-				"PsSetLoadImageNotifyRoutine", notify_routine);
-		});
-
+	auto add_image_notify = [st](vcpu&, const addr_t routine) -> NTSTATUS
+	{
+		try { return st->image_notify.add(routine) ? STATUS_SUCCESS : STATUS_INSUFFICIENT_RESOURCES; }
+		catch (const std::bad_alloc&) { return STATUS_INSUFFICIENT_RESOURCES; }
+	};
+	state.redirect(mod, "PsSetLoadImageNotifyRoutine", add_image_notify);
+	if (mod.find_export("PsSetLoadImageNotifyRoutineEx"))
+	{
+		state.redirect(mod, "PsSetLoadImageNotifyRoutineEx",
+			[add_image_notify](vcpu& cpu, const addr_t routine, const std::uint32_t flags) -> NTSTATUS
+			{
+				if (flags & ~1u) return STATUS_INVALID_PARAMETER_2;
+				// Conflicting-architecture subscriptions require per-registration filtering.
+				if (flags) return STATUS_NOT_SUPPORTED;
+				return add_image_notify(cpu, routine);
+			});
+	}
 	state.redirect(mod, "PsRemoveLoadImageNotifyRoutine",
-		[notify](vcpu&, const addr_t notify_routine) -> NTSTATUS
+		[st](vcpu& cpu, const addr_t routine) -> NTSTATUS
 		{
-			return remove_notify(notify->image, "PsRemoveLoadImageNotifyRoutine", notify_routine);
+			const auto result = st->image_notify.remove(routine, cpu.id(), st->in_lifecycle_callback(cpu.id()));
+			if (result == win::lifecycle_notify_registry::remove_result::callback_deadlock)
+				st->fail_thread_notify(cpu, "PsRemoveLoadImageNotifyRoutine: callback rundown deadlock");
+			return result == win::lifecycle_notify_registry::remove_result::removed
+				? STATUS_SUCCESS : STATUS_PROCEDURE_NOT_FOUND;
 		});
 
 	// There is one address space here, so a driver reading the target's memory gets its own.

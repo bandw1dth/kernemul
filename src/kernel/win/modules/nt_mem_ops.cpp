@@ -529,6 +529,7 @@ void modules::register_ntoskrnl_mem_ops(win_kernel_state& state, proc_module& mo
 
 			auto host = std::make_shared<section_host>();
 			host->is_image = (allocation_attributes & sec_image) != 0;
+			host->allocation_attributes = allocation_attributes;
 
 			if (file_handle)
 			{
@@ -638,7 +639,7 @@ void modules::register_ntoskrnl_mem_ops(win_kernel_state& state, proc_module& mo
 			if (view_size)
 				view_size.write(size);
 
-			st->views[base] = size;
+			st->system_views.insert(0, base, size);
 
 			THREAD_LOG_INFO("MmMapViewInSystemSpace(section=0x{:X}, '{}') -> 0x{:X}, {} bytes",
 				section, host->path, base, size);
@@ -649,22 +650,12 @@ void modules::register_ntoskrnl_mem_ops(win_kernel_state& state, proc_module& mo
 	state.redirect(mod, "MmUnmapViewInSystemSpace",
 		[st](vcpu& cpu, const addr_t mapped_base) -> NTSTATUS
 		{
-			const auto it = st->views.find(mapped_base);
-
-			if (it == st->views.end())
-			{
-				THREAD_LOG_WARN("MmUnmapViewInSystemSpace: 0x{:X} is not a mapped view",
-					mapped_base);
-				return STATUS_INVALID_PARAMETER;
-			}
-
-			auto& space = *cpu.curr_addr_space();
-			space.mmu_->unmap_virt(space, mapped_base, it->second);
-
-			THREAD_LOG_INFO("MmUnmapViewInSystemSpace(0x{:X}): {} bytes", mapped_base, it->second);
-
-			st->views.erase(it);
-
-			return STATUS_SUCCESS;
+			const bool removed = st->system_views.remove(0, mapped_base, [&](const auto size) {
+				auto& space = *cpu.curr_addr_space();
+				space.mmu_->unmap_virt(space, mapped_base, size);
+				THREAD_LOG_INFO("MmUnmapViewInSystemSpace(0x{:X}): {} bytes", mapped_base, size);
+				return true;
+			});
+			return removed ? STATUS_SUCCESS : STATUS_INVALID_PARAMETER;
 		});
 }

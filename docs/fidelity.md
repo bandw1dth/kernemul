@@ -34,6 +34,8 @@ It does not install a Windows driver. Run fixtures from PowerShell 7 (`pwsh`) wi
 .\tests\scripts\run-conformance.ps1 -Driver registration_conformance
 .\tests\scripts\run-conformance.ps1 -Driver thread_notify_conformance
 .\tests\scripts\run-conformance.ps1 -Driver thread_notify_boundaries
+.\tests\scripts\run-conformance.ps1 -Driver image_notify_conformance
+.\tests\scripts\run-conformance.ps1 -Driver image_notify_boundaries
 .\tests\scripts\run-model-tests.ps1
 .\tests\scripts\run-negative-tests.ps1
 ```
@@ -55,8 +57,9 @@ versions. Do not load the unsigned fixture into the host as part of this workflo
 
 ## Follow-on work
 
-1. Extend the classic system-thread lifecycle delivery to process creation, image
-   mapping, Ex thread modes, and target-context remote termination.
+1. Extend lifecycle delivery to process creation, kernel driver loads, Ex thread
+   modes, and target-context remote termination. Guest image-section mappings now
+   deliver notifications; see [image mapping](image-mapping.md) for scope and tests.
 2. Object/registry pre/post operation delivery using the retained registrations.
 3. Coherent process-local handles and guest EPROCESS.ObjectTable representation.
 4. Memory invariants across MMU, PFN, MDL, allocations, and guest-visible metadata.
