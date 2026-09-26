@@ -21,6 +21,11 @@ $manifest = [ordered]@{
     requestedSeconds = $Seconds; gitCommit = (& git -C $root rev-parse HEAD)
     stdout = $stdout; stderr = $stderr
 }
+$guestCi = Join-Path $root 'fs_x86_64\Windows\System32\ci.dll'
+if (Test-Path -LiteralPath $guestCi) {
+    $manifest.ciSha256 = (Get-FileHash -LiteralPath $guestCi).Hash
+    $manifest.ciVersion = (Get-Item -LiteralPath $guestCi).VersionInfo.ProductVersion
+}
 $manifest | ConvertTo-Json | Set-Content (Join-Path $run 'manifest.json')
 $timer = [Diagnostics.Stopwatch]::StartNew()
 $process = Start-Process -FilePath $exe -ArgumentList $Image -WorkingDirectory $root -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru

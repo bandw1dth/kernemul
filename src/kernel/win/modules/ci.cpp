@@ -1,175 +1,193 @@
 #include "ci.hpp"
 #include "../win_kernel.hpp"
 #include "../objects.hpp"
-#include "../pool.hpp"
 #include "../status.hpp"
 #include "../types.hpp"
 #include "../../../util/log.hpp"
-#include <openssl/evp.h>
 #include <array>
-#include <vector>
+#include <cstddef>
+#include <cstring>
+#include <initializer_list>
+#include <limits>
+#include <stdexcept>
+#include <type_traits>
 
 namespace
 {
-// A type the kernel does not store, so the layout is declared here; only its head is filled in.
+// Shared policy layout for modern 64-bit Windows 10/11 CI exports.
 #pragma pack(push, 8)
 struct policy_info_t
 {
 	std::uint32_t structure_size;
-	std::uint32_t verification_status;
+	NTSTATUS verification_status;
 	std::uint32_t flags;
 	std::uint32_t padding;
-	addr_t        authenticode_signing_time;
-	std::uint32_t chain_info_size;
-	std::uint32_t padding2;
-	addr_t        chain_info;
+	std::uint64_t chain_info;
+	std::int64_t revocation_time;
+	std::int64_t valid_from;
+	std::int64_t valid_to;
 };
 #pragma pack(pop)
 
-constexpr std::size_t sha256_size = 32;
+static_assert(sizeof(policy_info_t) == 48);
+static_assert(offsetof(policy_info_t, structure_size) == 0);
+static_assert(offsetof(policy_info_t, verification_status) == 4);
+static_assert(offsetof(policy_info_t, flags) == 8);
+static_assert(offsetof(policy_info_t, padding) == 12);
+static_assert(offsetof(policy_info_t, chain_info) == 16);
+static_assert(offsetof(policy_info_t, revocation_time) == 24);
+static_assert(offsetof(policy_info_t, valid_from) == 32);
+static_assert(offsetof(policy_info_t, valid_to) == 40);
+static_assert(sizeof(_UNICODE_STRING) == 16);
 
-std::array<std::uint8_t, sha256_size> sha256(const std::span<const std::uint8_t> data)
+policy_info_t failure_policy(const NTSTATUS status)
 {
-	std::array<std::uint8_t, sha256_size> digest{};
-	unsigned int size = 0;
-
-	EVP_Digest(data.data(), data.size(), digest.data(), &size, EVP_sha256(), nullptr);
-
-	return digest;
+	policy_info_t info{};
+	info.structure_size = sizeof(info);
+	info.verification_status = status;
+	return info;
 }
 
+// Fixed-size staging also zeros ABI padding; no guest-controlled allocations or sizes.
+struct staged_output
+{
+	addr_t address;
+	std::size_t size;
+	std::array<std::uint8_t, sizeof(policy_info_t)> bytes{};
+
+	template <typename T>
+	explicit staged_output(const emu_object<T>& target)
+		: address(target.address()), size(sizeof(T))
+	{
+		static_assert(sizeof(T) <= sizeof(policy_info_t));
+		static_assert(std::is_trivially_copyable_v<T>);
+	}
+
+	staged_output(const emu_object<policy_info_t>& target, const policy_info_t& value)
+		: staged_output(target)
+	{
+		std::memcpy(bytes.data(), &value, sizeof(value));
+	}
+};
+
+bool write_outputs(addr_space& space, const char* operation,
+	const std::initializer_list<staged_output> outputs)
+{
+	std::array<std::uint8_t, sizeof(policy_info_t)> scratch{};
+	// Preflight every present range before any mutation. These MMU reads/writes bypass
+	// guest PTE protection: this checks mapped access, not guest write permission.
+	for (const auto& output : outputs)
+	{
+		if (!output.address)
+			continue;
+		if (output.address > std::numeric_limits<addr_t>::max() - (output.size - 1))
+		{
+			THREAD_LOG_WARN("{}: preflight range overflow at 0x{:X}, size {}",
+				operation, output.address, output.size);
+			return false;
+		}
+		try
+		{
+			space.read_mem(output.address, scratch.data(), output.size);
+		}
+		catch (const std::runtime_error& error)
+		{
+			THREAD_LOG_WARN("{}: preflight read failed at 0x{:X}, size {}: {}",
+				operation, output.address, output.size, error.what());
+			return false;
+		}
+	}
+	// The MMU does not provide a transaction across these calls. A mapping change after
+	// preflight can still cause a partial write; report that memory failure explicitly.
+	for (const auto& output : outputs)
+	{
+		if (!output.address)
+			continue;
+		try
+		{
+			space.write_mem(output.address, output.bytes.data(), output.size);
+		}
+		catch (const std::runtime_error& error)
+		{
+			THREAD_LOG_WARN("{}: output write failed at 0x{:X}, size {}: {}",
+				operation, output.address, output.size, error.what());
+			return false;
+		}
+	}
+	return true;
+}
 }
 
-// All of these end in STATUS_INVALID_IMAGE_HASH: no catalogue or certificate store is here.
 void modules::register_ci(win_kernel_state& state, proc_module& mod)
 {
 	auto* st = &state;
 
 	state.redirect(mod, "CiCheckSignedFile",
-		[](vcpu&, const addr_t digest, const std::uint32_t digest_size,
+		[](vcpu& cpu, const addr_t digest, const std::uint32_t digest_size,
 			const std::uint32_t digest_identifier, const addr_t win_certificate,
 			const std::uint32_t certificate_size, emu_object<policy_info_t> policy_info,
-			const addr_t signing_time, emu_object<void> signer_digest,
-			emu_object<std::uint32_t> signer_digest_size) -> NTSTATUS
+			emu_object<std::int64_t> signing_time,
+			emu_object<policy_info_t> timestamp_policy_info) -> NTSTATUS
 		{
-			// Logged before anything is written back: an output pointer that cannot be written
-			// is worth seeing with the call that carried it.
-			THREAD_LOG_WARN("CiCheckSignedFile(digest=0x{:X}/{}, identifier={}, certificate="
-				"0x{:X}/{}, signing_time=0x{:X}, signer_digest=0x{:X}): nothing here holds a "
-				"certificate to check a chain against",
-				digest, digest_size, digest_identifier, win_certificate, certificate_size,
-				signing_time, signer_digest.address());
-
-			// Both outputs are optional and a caller that does not want them passes null.
-			if (policy_info)
-			{
-				policy_info_t info{};
-				info.structure_size = sizeof(info);
-				policy_info.write(info);
-			}
-
-			if (signer_digest_size)
-				signer_digest_size.write(0);
-
-			return STATUS_INVALID_IMAGE_HASH;
+			THREAD_LOG_WARN("CiCheckSignedFile(digest=0x{:X}/{}, algorithm={}, certificate="
+				"0x{:X}/{}): verification backend unavailable; returning INVALID_IMAGE_HASH",
+				digest, digest_size, digest_identifier, win_certificate, certificate_size);
+			const auto policy = failure_policy(STATUS_INVALID_IMAGE_HASH);
+			return write_outputs(*cpu.curr_addr_space(), "CiCheckSignedFile", {
+				staged_output(policy_info, policy), staged_output(signing_time),
+				staged_output(timestamp_policy_info, policy)
+			}) ? STATUS_INVALID_IMAGE_HASH : STATUS_ACCESS_VIOLATION;
 		});
 
-	// Nothing is allocated on the failure path above, so there is nothing to give back.
-	state.redirect(mod, "CiFreePolicyInfo", [](vcpu&, emu_object<policy_info_t> policy_info)
+	// No chains are allocated here. Never follow or free foreign guest pointers.
+	state.redirect(mod, "CiFreePolicyInfo", [](vcpu& cpu, emu_object<policy_info_t> policy_info)
 	{
-		if (!policy_info)
-			return;
-
-		THREAD_LOG_INFO("CiFreePolicyInfo(0x{:X})", policy_info.address());
-
-		policy_info.write({});
+		if (policy_info && write_outputs(*cpu.curr_addr_space(), "CiFreePolicyInfo",
+			{ staged_output(policy_info) }))
+			THREAD_LOG_INFO("CiFreePolicyInfo(0x{:X}): policy cleared", policy_info.address());
 	});
 
 	state.redirect(mod, "CiVerifyHashInCatalog",
 		[](vcpu& cpu, const addr_t hash, const std::uint32_t hash_size,
-			const std::uint32_t hash_algorithm, const bool is_reload_catalogs,
-			const std::uint32_t secure_process, const std::uint32_t acceptable_policy,
-			emu_object<addr_t> catalog_handle, emu_object<void> catalog_name,
-			const addr_t timestamp, emu_object<policy_info_t> policy_info) -> NTSTATUS
+			const std::uint32_t hash_algorithm, const std::uint32_t reload_catalogs,
+			const std::uint32_t secure_process, const std::uint32_t accepted_roots,
+			emu_object<policy_info_t> policy_info, emu_object<_UNICODE_STRING> catalog_name,
+			emu_object<std::int64_t> signing_time,
+			emu_object<policy_info_t> timestamp_policy_info) -> NTSTATUS
 		{
-			if (catalog_handle)
-				catalog_handle.write(0);
-
-			if (policy_info)
-			{
-				policy_info_t info{};
-				info.structure_size = sizeof(info);
-				policy_info.write(info);
-			}
-
-			std::string digest;
-
-			if (hash && hash_size)
-			{
-				std::vector<std::uint8_t> bytes(std::min<std::uint32_t>(hash_size, sha256_size));
-				cpu.curr_addr_space()->read_mem(hash, bytes.data(), bytes.size());
-
-				for (const auto b : bytes)
-					digest += std::format("{:02x}", b);
-			}
-
-			THREAD_LOG_WARN("CiVerifyHashInCatalog({}, algorithm={}, reload={}, secure={}, "
-				"policy=0x{:X}, timestamp=0x{:X}, name=0x{:X}): no catalogue is loaded",
-				digest, hash_algorithm, is_reload_catalogs, secure_process, acceptable_policy,
-				timestamp, catalog_name.address());
-
-			return STATUS_INVALID_IMAGE_HASH;
+			THREAD_LOG_WARN("CiVerifyHashInCatalog(hash=0x{:X}/{}, algorithm={}, reload={}, "
+				"secure={}, roots=0x{:X}): verification backend unavailable; returning INVALID_IMAGE_HASH",
+				hash, hash_size, hash_algorithm, reload_catalogs, secure_process, accepted_roots);
+			const auto policy = failure_policy(STATUS_INVALID_IMAGE_HASH);
+			return write_outputs(*cpu.curr_addr_space(), "CiVerifyHashInCatalog", {
+				staged_output(policy_info, policy), staged_output(catalog_name),
+				staged_output(signing_time), staged_output(timestamp_policy_info, policy)
+			}) ? STATUS_INVALID_IMAGE_HASH : STATUS_ACCESS_VIOLATION;
 		});
 
 	state.redirect(mod, "CiValidateFileObject",
-		[st](vcpu& cpu, const addr_t file_object, const std::uint32_t unknown1,
-			const std::uint32_t unknown2, emu_object<policy_info_t> policy_info,
-			emu_object<policy_info_t> timestamp_policy_info, const addr_t signing_time,
-			emu_object<void> digest, emu_object<std::uint32_t> digest_size,
+		[st](vcpu& cpu, const addr_t file_object, const std::uint32_t flags,
+			const std::uint8_t signing_level, emu_object<policy_info_t> policy_info,
+			emu_object<policy_info_t> timestamp_policy_info, emu_object<std::int64_t> signing_time,
+			const addr_t digest, emu_object<std::uint32_t> digest_size,
 			emu_object<std::uint32_t> digest_identifier) -> NTSTATUS
 		{
 			const auto host = st->objs.get_object<file_host>(file_object);
-
-			if (!host || !host->file)
-			{
+			const auto status = host && host->file ? STATUS_INVALID_IMAGE_HASH : STATUS_INVALID_PARAMETER;
+			if (status == STATUS_INVALID_PARAMETER)
 				THREAD_LOG_WARN("CiValidateFileObject: 0x{:X} is not a file object", file_object);
-				return STATUS_INVALID_PARAMETER;
-			}
+			else
+				THREAD_LOG_WARN("CiValidateFileObject(file=0x{:X}, flags=0x{:X}, level={}, digest=0x{:X}): "
+					"verification backend unavailable; returning INVALID_IMAGE_HASH",
+					file_object, flags, signing_level, digest);
 
-			const auto computed = sha256(host->file->data());
-
-			if (digest && digest_size)
-			{
-				const auto room = digest_size.read();
-
-				if (room >= computed.size())
-					cpu.curr_addr_space()->write_mem(digest.address(), computed.data(),
-						computed.size());
-
-				digest_size.write(static_cast<std::uint32_t>(computed.size()));
-			}
-
-			if (digest_identifier)
-				digest_identifier.write(sha256_size);
-
-			for (auto info : { policy_info, timestamp_policy_info })
-			{
-				if (!info)
-					continue;
-
-				policy_info_t zeroed{};
-				zeroed.structure_size = sizeof(zeroed);
-				info.write(zeroed);
-			}
-
-			std::string text;
-			for (const auto b : computed)
-				text += std::format("{:02x}", b);
-
-			THREAD_LOG_WARN("CiValidateFileObject('{}', {}, {}, signing_time=0x{:X}): sha256 is "
-				"{}, and nothing here can say whether it was signed",
-				host->path, unknown1, unknown2, signing_time, text);
-
-			return STATUS_INVALID_IMAGE_HASH;
+			// No verified digest is available. Leave the variable-size digest buffer untouched.
+			// digest_size is an in/out capacity; ignore its input because no digest is emitted.
+			// Policy Size is output-only, not an input capacity.
+			const auto policy = failure_policy(status);
+			return write_outputs(*cpu.curr_addr_space(), "CiValidateFileObject", {
+				staged_output(policy_info, policy), staged_output(timestamp_policy_info, policy),
+				staged_output(signing_time), staged_output(digest_size), staged_output(digest_identifier)
+			}) ? status : STATUS_ACCESS_VIOLATION;
 		});
 }

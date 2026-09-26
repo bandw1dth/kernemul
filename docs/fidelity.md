@@ -5,6 +5,10 @@ kernel semantics itself. A mapped Windows image is not a running Windows kernel.
 An API returning success is therefore not evidence that its underlying subsystem
 exists. This work replaces isolated return-value handlers with stateful services.
 
+The [Code Integrity boundary](code-integrity.md) documents the corrected modern
+CI calling conventions, policy-output layout, and explicitly unavailable trust
+backend. Correct output handling does not imply successful signature verification.
+
 ## Design rules
 
 - Keep CPU execution separate from guest OS state and policy.

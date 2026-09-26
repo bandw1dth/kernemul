@@ -1,4 +1,4 @@
-param([string]$SdkVersion = '10.0.28000.0')
+param([string]$SdkVersion = '10.0.28000.0', [string]$Driver = '*')
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
@@ -10,12 +10,21 @@ $sdk = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10'
 $out = Join-Path $root 'build-conformance'
 New-Item -ItemType Directory -Force $out | Out-Null
 $include = @("/I$vc\include", "/I$sdk\Include\$SdkVersion\km", "/I$sdk\Include\$SdkVersion\shared", "/I$sdk\Include\$SdkVersion\ucrt")
-foreach ($source in Get-ChildItem (Join-Path $root 'tests\drivers\*.c')) {
+$sources = @(Get-ChildItem (Join-Path $root "tests\drivers\$Driver.c"))
+if (-not $sources.Count) { throw "No guest fixtures match: $Driver" }
+foreach ($source in $sources) {
     $obj = Join-Path $out ($source.BaseName + '.obj')
     $sys = Join-Path $out ($source.BaseName + '.sys')
     & "$vc\bin\Hostx64\x64\cl.exe" /nologo /c /TC /O1 /GS- /Zl /W4 /D_AMD64_ /DAMD64 /D_KERNEL_MODE @include "/Fo$obj" $source.FullName
     if ($LASTEXITCODE) { throw "Compile failed: $($source.Name)" }
-    & "$vc\bin\Hostx64\x64\link.exe" /nologo /driver /subsystem:native /entry:DriverEntry /nodefaultlib /machine:x64 "/out:$sys" $obj "$sdk\Lib\$SdkVersion\km\x64\ntoskrnl.lib" "$sdk\Lib\$SdkVersion\km\x64\hal.lib"
+    $extraLibraries = @()
+    if ($source.BaseName -eq 'ci_conformance') {
+        $ciLibrary = Join-Path $out 'ci_fixture.lib'
+        & "$vc\bin\Hostx64\x64\lib.exe" /nologo /machine:x64 "/def:$root\tests\drivers\ci_exports.def" "/out:$ciLibrary"
+        if ($LASTEXITCODE) { throw 'CI fixture import library failed.' }
+        $extraLibraries += $ciLibrary
+    }
+    & "$vc\bin\Hostx64\x64\link.exe" /nologo /driver /subsystem:native /entry:DriverEntry /nodefaultlib /machine:x64 "/out:$sys" $obj "$sdk\Lib\$SdkVersion\km\x64\ntoskrnl.lib" "$sdk\Lib\$SdkVersion\km\x64\hal.lib" @extraLibraries
     if ($LASTEXITCODE) { throw "Link failed: $($source.Name)" }
     Write-Output $sys
 }
