@@ -36,8 +36,12 @@ the object manager before their bodies are linked into the active-process list.
 Their handle entries therefore refer to real headers with live handle and pointer
 counts, just as thread and event entries do.
 
-`ObReferenceProcessHandleTable` validates the process identity and references
-its table; `ObDereferenceProcessHandleTable` balances the reference.
+`ObReferenceProcessHandleTable` validates the process identity and acquires its
+guest `EPROCESS.RundownProtect` reference before returning `ObjectTable`.
+A missing table releases the acquired reference. On the pinned x64 kernel,
+`ObDereferenceProcessHandleTable` and `PsReleaseProcessExitSynchronization` are
+the same function; both release that process rundown reference. The existing
+process API handler owns both release names.
 `ExEnumHandleTable` visits a snapshot of live entries without holding a host
 table lock across guest code. On the tested x64 kernel its callback is
 `callback(table, entry, handle, context)`. The callback must unlock the entry
@@ -49,8 +53,13 @@ The callback ABI and level-one lookup arithmetic were checked against the exact
 guest `ntoskrnl.exe` version 10.0.26100.9444, SHA-256
 `75665496A75FC020A0573523F3F77D7C719479ACEB5806A98D82FF2D1B5314A1`.
 `ExEnumHandleTable` is at RVA `0x8a5500`; its lookup helper is at `0x872460`.
+The private table-reference routine is at `0x8a77a0`; its folded release routine
+is at `0x9fe3e0`. PDB records and local disassembly confirm the acquisition at
+`EPROCESS+0x1e8` and subsequent table read at `EPROCESS+0x300`. The fixture gates
+its private-RVA checks on the exact kernel hash before launching the emulator.
 Local disassembly evidence is in `build-conformance/handle-table-native-abi.txt`
-and `build-conformance/handle-table-native-layout.txt`.
+and `build-conformance/handle-table-native-layout.txt`; rundown evidence is in
+`build-conformance/handle-table-rundown-native-abi.txt`.
 
 ## Lifecycle and limits
 
@@ -61,12 +70,19 @@ storage and referenced owners are retained, so stale guest pointers do not
 become pointers into reused allocations.
 
 This does not implement Windows' complete handle-table allocator, lock/refcount
-cache protocol, or blocking rundown. Table references protect retained storage;
-they do not delay process exit. Process-exit rundown does not yet dispatch
+cache protocol, or blocking rundown. Process rundown references are represented
+in guest memory; retained storage keeps exposed pointers valid, but references
+do not yet delay process exit. Process-exit rundown does not yet dispatch
 device cleanup/close IRPs. Explicit last-handle closes do. Object reclamation,
 handle inheritance, arbitrary guest edits to handle entries, and complete
 object-security policy remain outside this pass. Private layout and callback
 behavior on ARM64 are not established by the x64 validation.
+
+Hook-level rundown operations share a per-emulator serialized service. Beginning
+rundown preserves outstanding references and rejects new acquisitions; later
+releases drain the count. This does not provide atomic interoperability with
+arbitrary guest instructions that directly modify a rundown word, nor implement
+Windows' blocking rundown wait protocol.
 
 Object type indices and other private object-manager metadata remain subject to
 the existing synthetic object model. Header/body addresses and counts being
@@ -108,6 +124,7 @@ tests/scripts/build-drivers.ps1 -Driver handle_table_conformance
 tests/scripts/build-handle-user.ps1
 tests/scripts/run-handle-tables.ps1
 tests/scripts/build-x86-allocator-tests.ps1 -Run
+tests/scripts/build-rundown-tests.ps1 -Run
 tests/scripts/build-drivers.ps1 -Driver storage_conformance
 tests/scripts/run-conformance.ps1 -Driver storage_conformance
 tests/scripts/build-drivers.ps1 -Driver handle_migration_conformance
@@ -127,19 +144,19 @@ zero runtime failures.
 ## Validation (2026-09-27, x64 WHP)
 
 The Release build passed. The validated generic executable is retained locally
-at `build-conformance/handle-tables-validated-20260927/kernemul.exe`, SHA-256
-`4E12C3CBED44DE74A0B425970AC61D1408466654B10E53A006A6FAB86AB06723`.
+at `build-conformance/handle-tables-rundown-validated-20260927/kernemul.exe`, SHA-256
+`453AF5D8C0F1F68E773B4710B3761A1F01E86C8D6E914B165A90527B958AE4B6`.
 
-- Handle tables: 72 required assertion labels, 942 passing assertions, both guest
+- Handle tables: 81 required assertion labels, 951 passing assertions, both guest
   processes exited, all fixture/executable hashes stable. Manifest:
-  `build-conformance/handle-tables-20260927-012940-140.json`.
+  `build-conformance/handle-tables-20260927-014803-318.json`.
 - Attach/address spaces: 41 required labels and 69 passing assertions.
-  Manifest: `build-conformance/attach-20260927-012950-776.json`.
+  Manifest: `build-conformance/attach-20260927-014813-636.json`.
 - Custom device: 15 passing assertions. Failed publication separately produced
   exactly one CREATE, CLEANUP, and CLOSE in order, then one fatal hook diagnostic
   and exit 1 with no guest continuation. Manifests:
-  `device_handle_rollback-20260927-012934-202.json` and
-  `device-handle-rollback-negative-20260927-012929-185.json` under
+  `device_handle_rollback-20260927-014828-887.json` and
+  `device-handle-rollback-negative-20260927-014823-715.json` under
   `build-conformance/`.
 - Storage, CI verification, exception delivery, migration, timers, executive
   callbacks, registration, registry notification, firmware, physical resources,
@@ -150,6 +167,9 @@ at `build-conformance/handle-tables-validated-20260927/kernemul.exe`, SHA-256
 - The production x64 allocator test passed serialization, 2,048 concurrent
   allocations, translations/data integrity, and mapping-failure recovery. Removing
   the allocation locks made its negative control fail.
+- The production rundown service passed concurrent exact-count acquisition and
+  release, active-state draining/refusal, overflow/underflow, initialization, and
+  guest-memory-authority tests. Removing its lock reproduced lost increments.
 
 Independent focused testing and static review were used. The migration fixture
 tests exported Zw operations; it explicitly skips direct NtFlushKey/NtAlpcCreatePort

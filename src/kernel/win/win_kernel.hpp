@@ -24,6 +24,7 @@
 #include "mdl.hpp"
 #include "per_cpu.hpp"
 #include "objects.hpp"
+#include "rundown.hpp"
 #include "modules/fltmgr.hpp"
 #include "modules/cng.hpp"
 #include "modules/ci.hpp"
@@ -69,6 +70,7 @@ struct win_kernel_state : kernel_state
 	win_handle_table* find_handle_table(addr_t address);
 	win_handle_table* find_process_handle_table(addr_t eprocess);
 
+	win::rundown_service rundown;
 	win_obj_manager objs;
 	win_pool pool;
 	win_registry reg;

@@ -3,6 +3,8 @@
 #include "../objects.hpp"
 #include "../status.hpp"
 #include "../process_params.hpp"
+#include "../process.hpp"
+#include "../rundown.hpp"
 #include "../string.hpp"
 #include "../types.hpp"
 #include "../callback_registry.hpp"
@@ -307,16 +309,19 @@ void modules::register_ntoskrnl_object_ops(win_kernel_state& state, proc_module&
 	state.redirect(mod, "ObReferenceProcessHandleTable",
 		[st = &state](vcpu&, emu_object<_EPROCESS> process) -> addr_t
 		{
-			const auto table = st->find_process_handle_table(process.address());
-			if (!table || !table->reference()) return 0;
-			return table->guest_address();
-		});
-	if (mod.find_symbol("ObDereferenceProcessHandleTable"))
-		state.redirect(mod, "ObDereferenceProcessHandleTable",
-		[st = &state](vcpu&, emu_object<_EPROCESS> process)
-		{
-			if (const auto table = st->find_process_handle_table(process.address()))
-				table->dereference();
+			const auto owner = st->find_process_by_object(process.address());
+			if (!owner) return 0;
+			const auto address = owner->handle_table().guest_address();
+			if (!address) return 0;
+			const auto rundown = process.field(&_EPROCESS::RundownProtect);
+			if (!st->rundown.acquire(rundown)) return 0;
+			if (guest_va(process.field(&_EPROCESS::ObjectTable).read()) != address)
+			{
+				(void)st->rundown.release(rundown);
+				return 0;
+			}
+			// The release alias is registered by nt_process_ops; no host table reference.
+			return address;
 		});
 
 	// Windows 10.0.26100: callback(table, entry, handle, context), with entry locked.

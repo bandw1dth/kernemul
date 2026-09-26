@@ -7,6 +7,7 @@
  * ACCESS_DENIED for access upgrades and missing PROCESS_DUP_HANDLE.
  */
 #include <ntifs.h>
+#include <ntimage.h>
 #include <intrin.h>
 #ifndef PROCESS_DUP_HANDLE
 #define PROCESS_DUP_HANDLE 0x0040
@@ -15,6 +16,8 @@ NTKERNELAPI UCHAR *PsGetProcessImageFileName(PEPROCESS);
 NTSYSAPI NTSTATUS NTAPI ZwDuplicateObject(HANDLE,HANDLE,HANDLE,PHANDLE,ACCESS_MASK,ULONG,ULONG);
 typedef BOOLEAN (NTAPI *ENUM_CB)(PVOID,PVOID,HANDLE,PVOID);
 typedef BOOLEAN (NTAPI *ENUM_FN)(PVOID,ENUM_CB,PVOID,PHANDLE);
+typedef PVOID (NTAPI *REF_TABLE_FN)(PEPROCESS);
+typedef VOID (NTAPI *RELEASE_PROCESS_FN)(PEPROCESS);
 
 #define CONTROL ((PULONG)(ULONG_PTR)0x200000000ULL)
 #define SELF ((HANDLE)(LONG_PTR)-1)
@@ -25,6 +28,8 @@ static HANDLE pids[2], local[2], kernel[2];
 static PVOID objects[2], tables[2];
 static LONG64 pointer_baseline[2];
 static ENUM_FN enumerate;
+static REF_TABLE_FN reference_table;
+static RELEASE_PROCESS_FN release_process;
 
 static void check(BOOLEAN ok,const char *label) {
     DbgPrint("CONFORMANCE %s %s\n",ok?"PASS":"FAIL",label);
@@ -39,6 +44,51 @@ static void poke(ULONG index,ULONG v) {
     __writeeflags(f|(1ULL<<18)); CONTROL[index]=v; __writeeflags(f);
 }
 static PVOID table(PEPROCESS p) { return *(PVOID *)((PUCHAR)p+0x300); }
+static void resolve_reference_table(void) {
+    UNICODE_STRING name; PUCHAR base; PIMAGE_DOS_HEADER dos; PIMAGE_NT_HEADERS64 nt;
+    BOOLEAN valid;
+    /* The runner verifies the exact kernel SHA256 before permitting these RVAs. */
+    RtlInitUnicodeString(&name,L"PsReleaseProcessExitSynchronization");
+    release_process=(RELEASE_PROCESS_FN)MmGetSystemRoutineAddress(&name);
+    check(release_process!=NULL,"table-ref-release-export");
+    if(!release_process) return;
+    base=(PUCHAR)release_process-0x9FE3E0;
+    dos=(PIMAGE_DOS_HEADER)base;
+    valid=dos->e_magic==IMAGE_DOS_SIGNATURE && dos->e_lfanew>0 && dos->e_lfanew<0x1000;
+    if(valid) {
+        nt=(PIMAGE_NT_HEADERS64)(base+dos->e_lfanew);
+        valid=nt->Signature==IMAGE_NT_SIGNATURE && nt->FileHeader.Machine==IMAGE_FILE_MACHINE_AMD64 &&
+            nt->OptionalHeader.Magic==IMAGE_NT_OPTIONAL_HDR64_MAGIC && nt->OptionalHeader.SizeOfImage>0x9FE3E0;
+    }
+    check(valid,"table-ref-pinned-image-base");
+    if(valid) reference_table=(REF_TABLE_FN)(base+0x8A77A0);
+}
+static void table_reference_tests(PEPROCESS p) {
+    volatile ULONG_PTR *rundown=(volatile ULONG_PTR *)((PUCHAR)p+0x1E8);
+    PVOID volatile *object_table=(PVOID volatile *)((PUCHAR)p+0x300);
+    ULONG_PTR saved=*rundown, observed; PVOID saved_table=*object_table, result;
+    /* Subjects are parked until exercise finishes; restore every temporarily changed field. */
+    check(reference_table && release_process && saved_table && !(saved&1),"table-ref-live-preconditions");
+    if(!reference_table || !release_process || !saved_table || (saved&1)) return;
+    result=reference_table(p);
+    check(result==saved_table && *rundown==saved+2,"table-ref-acquires-process-rundown");
+    if(result) release_process(p);
+    check(*rundown==saved,"table-ref-aliased-release-balances");
+    *rundown=saved;
+    *object_table=NULL;
+    result=reference_table(p); observed=*rundown;
+    *object_table=saved_table; *rundown=saved;
+    check(!result && observed==saved,"table-ref-null-table-releases-rundown");
+    *object_table=tables[1];
+    result=reference_table(p); observed=*rundown;
+    *object_table=saved_table; *rundown=saved;
+    check(!result && observed==saved,"table-ref-foreign-table-releases-rundown");
+    *rundown=saved|1;
+    result=reference_table(p); observed=*rundown;
+    *rundown=saved;
+    check(!result && observed==(saved|1),"table-ref-active-rundown-refused");
+    check(*object_table==saved_table && *rundown==saved,"table-ref-fields-restored");
+}
 static LONG count(PVOID t) { return *(volatile LONG *)((PUCHAR)t+0x58); }
 static volatile ULONG64 *entry(PVOID t,HANDLE h) {
     ULONG_PTR code=*(ULONG_PTR *)((PUCHAR)t+8), index=(ULONG_PTR)h/4;
@@ -149,6 +199,7 @@ static void exercise(void) {
     check(tables[0] && tables[1] && tables[0]!=tables[1] &&
         tables[0]!=table(PsGetCurrentProcess()) && tables[1]!=table(PsGetCurrentProcess()),"distinct-live-system-tables");
     if(!tables[0] || !tables[1]) return;
+    table_reference_tests(subjects[0]);
     process_header_tests(PsGetCurrentProcess(),PsGetCurrentProcessId());
     s=PsLookupProcessByProcessId((HANDLE)8,&seeded);
     check(s==STATUS_SUCCESS && seeded,"seeded-process-lookup");
@@ -315,6 +366,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver,PUNICODE_STRING path) {
     RtlInitUnicodeString(&name,L"ExEnumHandleTable"); enumerate=(ENUM_FN)MmGetSystemRoutineAddress(&name);
 
     check(enumerate!=NULL,"enum-export-available");
+    resolve_reference_table();
     InitializeObjectAttributes(&oa,NULL,OBJ_KERNEL_HANDLE,NULL,NULL);
     for(i=0;i<2;++i) {
         s=ZwCreateEvent(&kernel[i],EVENT_ALL_ACCESS,&oa,NotificationEvent,FALSE);

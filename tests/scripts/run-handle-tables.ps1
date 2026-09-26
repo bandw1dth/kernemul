@@ -5,6 +5,10 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+$kernel = Join-Path $root 'fs_x86_64\Windows\System32\ntoskrnl.exe'
+$pinnedKernelHash = '75665496A75FC020A0573523F3F77D7C719479ACEB5806A98D82FF2D1B5314A1'
+$kernelHash = (Get-FileHash -LiteralPath $kernel -Algorithm SHA256).Hash
+if ($kernelHash -ne $pinnedKernelHash) { throw 'Private handle-table RVAs require the pinned kernel SHA256.' }
 $exe = (Resolve-Path (Join-Path $root $Executable)).Path
 $exeHash = (Get-FileHash -LiteralPath $exe).Hash
 $fixtures = [ordered]@{}
@@ -38,6 +42,13 @@ foreach ($marker in $expected) {
 $driverSource = Join-Path $root 'tests\drivers\handle_table_conformance.c'
 # Derive the full assertion set from this fixture; repeated loop/context assertions are valid.
 $expectedAssertions = @([regex]::Matches((Get-Content -LiteralPath $driverSource -Raw), '"([a-z][a-z0-9-]+)"\s*\)') | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+$requiredReferenceAssertions = @(
+    'table-ref-release-export', 'table-ref-pinned-image-base', 'table-ref-live-preconditions',
+    'table-ref-acquires-process-rundown', 'table-ref-aliased-release-balances',
+    'table-ref-null-table-releases-rundown', 'table-ref-foreign-table-releases-rundown',
+    'table-ref-active-rundown-refused', 'table-ref-fields-restored'
+)
+$expectedAssertions = @(@($expectedAssertions) + $requiredReferenceAssertions | Sort-Object -Unique)
 $assertions = @([regex]::Matches($log, 'CONFORMANCE PASS ([a-z0-9-]+)\b') | ForEach-Object { $_.Groups[1].Value })
 foreach ($assertion in $expectedAssertions) {
     if ($assertion -cnotin $assertions) { $passed = $false }
@@ -78,7 +89,8 @@ function Get-FinalHash([string]$Path) {
     try { (Get-FileHash -LiteralPath $Path -ErrorAction Stop).Hash } catch { $null }
 }
 $exeHashAfter = Get-FinalHash $exe
-$hashesStable = $exeHashAfter -eq $exeHash
+$kernelHashAfter = Get-FinalHash $kernel
+$hashesStable = $exeHashAfter -eq $exeHash -and $kernelHashAfter -eq $pinnedKernelHash
 foreach ($fixture in $fixtures.Values) {
     $fixture.HashAfter = Get-FinalHash $fixture.Source
     $fixture.GuestHashAfter = Get-FinalHash $fixture.Guest
@@ -94,9 +106,11 @@ $manifest = [ordered]@{
     Passed = $passed; Exited = $exited; TimedOut = -not $exited; ExitCode = $process.ExitCode
     Arguments = $arguments; WorkingDirectory = $root
     Executable = $exe; ExecutableHash = $exeHash; ExecutableHashAfter = $exeHashAfter
+    Kernel = $kernel; PinnedKernelHash = $pinnedKernelHash; KernelHash = $kernelHash; KernelHashAfter = $kernelHashAfter
     Fixtures = $fixtures; HashesStable = $hashesStable; TimeoutSeconds = $TimeoutSeconds
     Markers = $actual; ExpectedMarkers = $expected; MarkerCounts = $markerCounts
     ExpectedAssertions = $expectedAssertions; PassedAssertions = $assertions
+    RequiredReferenceAssertions = $requiredReferenceAssertions
     ProcessHeaderAssertionCounts = $processHeaderAssertionCounts
     TerminationStatuses = @($terminations | ForEach-Object { '0x' + $_.Groups[1].Value })
     ForbiddenCounts = $forbiddenCounts; Stdout = $out; Stderr = $err

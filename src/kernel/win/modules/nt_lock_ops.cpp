@@ -167,58 +167,57 @@ bool take_resource(const emu_object<_ERESOURCE>& resource, vcpu& cpu,
 
 }
 
-// A redirect runs with its cpu stopped, so none of these locks can contend.
+// Rundown hooks share the per-kernel service across concurrently stopped vCPUs.
 void modules::register_ntoskrnl_lock_ops(win_kernel_state& state, proc_module& mod)
 {
 	auto* st = &state;
 
 	// The linker folds ExInitializeRundownProtection and KeInitializeSpinLock onto this.
-	// One thread runs at a time here, so a spin lock is a word that is never contended.
+	// Use the rundown service for the folded initialization entry as well.
 	state.redirect(mod, "KeInitializeSpinLock",
-		[](vcpu&, emu_object<std::uint64_t> spin_lock)
+		[st](vcpu&, win::rundown_ref spin_lock)
 		{
 			if (!spin_lock)
 				return;
 
-			spin_lock.write(0);
+			st->rundown.initialize(spin_lock);
 
 			THREAD_LOG_INFO("KeInitializeSpinLock(lock=0x{:X})", spin_lock.address());
 		});
 
 	// Rundown protection counts users of an object against a teardown that waits for them.
-	// Nothing here tears one down, so acquiring always succeeds and the count is the record.
+	// Counts remain in guest memory; active rundown refuses new acquisitions.
 	state.redirect(mod, "ExInitializeRundownProtection",
-		[](vcpu&, emu_object<std::uint64_t> rundown_ref)
+		[st](vcpu&, win::rundown_ref rundown_ref)
 		{
 			if (!rundown_ref)
 				return;
 
-			rundown_ref.write(0);
+			st->rundown.initialize(rundown_ref);
 
 			THREAD_LOG_INFO("ExInitializeRundownProtection(0x{:X})", rundown_ref.address());
 		});
 
 	state.redirect(mod, "ExAcquireRundownProtection",
-		[](vcpu&, emu_object<std::uint64_t> rundown_ref) -> bool
+		[st](vcpu&, win::rundown_ref rundown_ref) -> bool
 		{
 			if (!rundown_ref)
 				return false;
 
-			rundown_ref.write(rundown_ref.read() + 2);
+			const auto acquired = st->rundown.acquire(rundown_ref);
 
-			THREAD_LOG_INFO("ExAcquireRundownProtection(0x{:X}) -> true", rundown_ref.address());
+			THREAD_LOG_INFO("ExAcquireRundownProtection(0x{:X}) -> {}", rundown_ref.address(), acquired);
 
-			return true;
+			return acquired;
 		});
 
 	state.redirect(mod, "ExReleaseRundownProtection",
-		[](vcpu&, emu_object<std::uint64_t> rundown_ref)
+		[st](vcpu&, win::rundown_ref rundown_ref)
 		{
 			if (!rundown_ref)
 				return;
 
-			const auto count = rundown_ref.read();
-			rundown_ref.write(count >= 2 ? count - 2 : 0);
+			(void)st->rundown.release(rundown_ref);
 
 			THREAD_LOG_INFO("ExReleaseRundownProtection(0x{:X})", rundown_ref.address());
 		});
@@ -370,17 +369,15 @@ void modules::register_ntoskrnl_lock_ops(win_kernel_state& state, proc_module& m
 			return STATUS_SUCCESS;
 		});
 
-	// Nothing can drop a reference while this cpu is stopped, so an outstanding one never ends.
-	state.redirect(mod, "ExWaitForRundownProtectionRelease", [](vcpu&, win::rundown_ref run_ref)
+	// This marks rundown and reports outstanding references; it does not block.
+	state.redirect(mod, "ExWaitForRundownProtectionRelease", [st](vcpu&, win::rundown_ref run_ref)
 	{
 		if (!run_ref)
 			return;
 
-		if (const auto held = win::rundown_references(run_ref))
+		if (const auto held = st->rundown.begin(run_ref))
 			THREAD_LOG_ERR("ExWaitForRundownProtectionRelease: 0x{:X} has {} references and "
 				"nothing here can wait", run_ref.address(), held);
-
-		win::begin_rundown(run_ref);
 
 		THREAD_LOG_INFO("ExWaitForRundownProtectionRelease(0x{:X}): running down",
 			run_ref.address());
@@ -453,7 +450,7 @@ void modules::register_ntoskrnl_lock_ops(win_kernel_state& state, proc_module& m
 		});
 
 	state.redirect(mod, "ExWaitForRundownProtectionReleaseCacheAware",
-		[](vcpu& cpu, emu_object<_EX_RUNDOWN_REF_CACHE_AWARE> cache_aware)
+		[st](vcpu& cpu, emu_object<_EX_RUNDOWN_REF_CACHE_AWARE> cache_aware)
 		{
 			if (!cache_aware)
 				return;
@@ -475,8 +472,7 @@ void modules::register_ntoskrnl_lock_ops(win_kernel_state& state, proc_module& m
 				const win::rundown_ref run_ref(*cpu.curr_addr_space(),
 					refs + static_cast<std::uint64_t>(entry.RunRefSize) * i);
 
-				held += win::rundown_references(run_ref);
-				win::begin_rundown(run_ref);
+				held += st->rundown.begin(run_ref);
 			}
 
 			if (held)

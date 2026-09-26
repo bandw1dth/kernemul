@@ -256,7 +256,7 @@ void modules::register_ntoskrnl_process_ops(win_kernel_state& state, proc_module
 
 			const auto rundown = target.field(&_EPROCESS::RundownProtect);
 
-			if (!win::acquire_rundown(rundown))
+			if (!st->rundown.acquire(rundown))
 			{
 				THREAD_LOG_WARN("PsAcquireProcessExitSynchronization: 0x{:X} is running down",
 					target.address());
@@ -264,7 +264,7 @@ void modules::register_ntoskrnl_process_ops(win_kernel_state& state, proc_module
 			}
 
 			THREAD_LOG_INFO("PsAcquireProcessExitSynchronization(0x{:X}): {} references",
-				target.address(), win::rundown_references(rundown));
+				target.address(), st->rundown.references(rundown));
 
 			return STATUS_SUCCESS;
 		});
@@ -279,7 +279,7 @@ void modules::register_ntoskrnl_process_ops(win_kernel_state& state, proc_module
 
 		const auto rundown = target.field(&_EPROCESS::RundownProtect);
 
-		if (!win::release_rundown(rundown))
+		if (!st->rundown.release(rundown))
 		{
 			THREAD_LOG_ERR("PsReleaseProcessExitSynchronization: 0x{:X} holds no reference",
 				target.address());
@@ -287,7 +287,7 @@ void modules::register_ntoskrnl_process_ops(win_kernel_state& state, proc_module
 		}
 
 		THREAD_LOG_INFO("PsReleaseProcessExitSynchronization(0x{:X}): {} references left",
-			target.address(), win::rundown_references(rundown));
+			target.address(), st->rundown.references(rundown));
 	};
 
 	state.redirect(mod, "PsReleaseProcessExitSynchronization", release_exit_sync);
