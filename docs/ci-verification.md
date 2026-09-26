@@ -101,6 +101,58 @@ The guest positive fixture requires host trust for its particular signed system
 images and catalog. The isolated private-root suite does not. See
 [`tests/ci/README.md`](../tests/ci/README.md) for optional real-image integration.
 
+## Validation on 2026-09-26
+
+Generic implementation commit: `4ab62d8`. Frozen x64/WHP executable SHA-256:
+`6BF191636BE830273F95F6197EDE709131738791BFD8726F2F80F81EF0072B51`.
+
+- Isolated host fixtures: **46 checks, zero failures**.
+- Host suite with the mapped `ntoskrnl.exe`, `fltmgr.sys`, and two catalogs:
+  **50 checks, zero failures**.
+- Guest cryptographic CI fixture: **49 passes**; original ABI fixture: **52 passes**.
+- Process-attachment regression, using both companion guest processes: **69 passes**.
+- Model programs: **12/12 pass**, including bounded discovery among 5,000 files
+  and 5,000 empty directories.
+
+Local evidence: `build-conformance/ci-host-final-expanded.log`,
+`ci-integration-final-expanded.log`, `ci-guest-final.log`, `ci-abi-final.log`,
+`attach-20260926-154956-731.json`, and `ci-model-final.log`. A preceding standalone
+attach invocation lacked its companions and timed out; it is not the accepted
+regression result.
+
+Legacy countersignatures, multiple timestamp selection, revocation-cache policy,
+nested mixed-algorithm signatures, and SHA-384/SHA-512 embedded PE files remain
+untested. RFC 3161 binding, trusted historical time, expiry without a valid
+timestamp, SHA-1/SHA-256 PE verification, and corrupt-catalog fallback are covered.
+
+### Initial target capture
+
+`kernel-20260926-155121-110` used the existing local-only in-memory DEBUGCTL lab
+compatibility patch. The driver on disk was unchanged. Both system-image SHA-256
+requests returned `STATUS_SUCCESS`, with real signer certificates and authenticated
+timestamps. The six requests using algorithms other than the signed SHA-256 digest
+correctly returned digest mismatch. No request returned backend unavailable.
+
+VGK still emitted the `E00000EF` diagnostic naming `fltmgr.sys`; signature success
+does not establish that VGK accepts every remaining CI policy/chain field. The run
+ended at nine seconds on a separate `PsCreateSystemThread` callback IRQL failure,
+so it does not establish sustained target stability.
+
+Read-only diagnosis found an existing scheduler defect: after TID 188 acquired a
+shared spinlock and raised CPU 0 to DISPATCH_LEVEL (trace line 8588), TID 168 ran
+before the release. The scheduler's ordinary switch path does not gate on IRQL,
+and the saved thread register state omits CR8. The OB callback guard correctly
+rejected the inherited elevated context. These scheduler/thread/IRQL sources were
+unchanged by this pass; the previous capture happened to pass the same creation
+site. Changed timing is a plausible trigger, not a proven causal mechanism.
+
+The next scheduling pass should defer ordinary switches at DISPATCH_LEVEL or
+above, preserve legal per-thread IRQL below that level, and restore KPCR/CR8
+together. A forced quantum expiration inside a spinlock region must demonstrate
+that no other ordinary thread runs until IRQL lowers. APC_LEVEL preservation and
+shutdown responsiveness need separate checks. The callback guard must remain.
+This work is deliberately outside the current cryptographic verification scope.
+
 ## Sources
 
 - [Microsoft Code Integrity security policy](https://csrc.nist.gov/CSRC/media/projects/cryptographic-module-validation-program/documents/security-policies/140sp3644.pdf)
