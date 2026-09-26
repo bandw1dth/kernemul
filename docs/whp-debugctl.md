@@ -9,10 +9,10 @@ limitation, not solely corruption by the emulator's internal single stepping.
 No production DEBUGCTL shadow or forced read-back is introduced by this pass.
 
 The result is host-specific: Windows 11 Pro 10.0.26200, Intel Core i9-14900HX,
-Windows SDK 10.0.28000.0, WinHvPlatform.dll 10.0.26100.9278. The probe process
-was not elevated. No elevation, permission-policy, or host configuration changes
-were attempted. A different host, privilege context, or hypervisor configuration
-must be measured independently.
+Windows SDK 10.0.28000.0, WinHvPlatform.dll 10.0.26100.9278. Initial probes ran
+without elevation; the subsequent administrator run reproduced the results.
+No permission-policy or host configuration changes were made. A different host
+or hypervisor configuration must still be measured independently.
 
 ## Native probe results
 
@@ -77,6 +77,34 @@ exit zero, stable hashes, empty stderr, and `SUMMARY failures=0`. Its observatio
 match the matrix above. Unknown-capability handling was inspected in source but
 was not triggered on this host. This verification is one run in the recorded
 configuration, not evidence of deterministic behavior across platforms.
+
+## Elevated comparison
+
+The user-authorized elevated rerun completed successfully, with
+`ProcessIsAdministrator=true` in
+`build-conformance/whp-debugctl-20260927-004512-887-27508.json`.
+The source hash matches the non-elevated verification run exactly:
+`574AEFAA408D97BEC198B21FA5FC9D3FCCF42413E4D24287CEA5BBA300275AE8`.
+Both capability and finding records are identical across the two manifests.
+
+In the elevated run, DEBUGCTL writes `1`, `2`, `3`, and `4` still read zero with
+TF clear, both in the default partition and with unhandled-MSR exits enabled.
+The PMU/LBR capability remains zero. Exact DEBUGCTL action-list configurations
+still fail setup with `0xc0350006`; requesting LBR still fails with `0xc0350005`.
+The SYSENTER and invalid-MSR controls pass, as does the invalid action-list
+configuration control. The diagnostic exits zero with `SUMMARY failures=0`,
+empty stderr, stable hashes, and no timeout. This confirms the unchanged
+behavior under ordinary administrator elevation on this machine; it does not
+identify the internal hypervisor permission or feature policy responsible.
+
+Elevation is therefore not the missing native-enablement step in the tested
+configuration. Faithful LBR/BTF support here would require a software execution
+and debug model, or a backend/configuration that exposes the necessary native
+facilities. Before undertaking a full software model, a bounded feasibility pass
+should prove reliable instruction interception and separate guest-requested
+TF/#DB behavior from the hook engine's stepping. A writable MSR shadow alone
+does not meet that requirement. The evidence does not establish that the target
+requires every LBR/BTF feature, nor that implementing them guarantees startup.
 
 ## Architectural boundary
 
