@@ -61,7 +61,7 @@ void modules::register_ntoskrnl_thread_ops(win_kernel_state& state, proc_module&
 			std::uint64_t handle = 0;
 			auto rollback = [&]
 			{
-				if (handle) sys_proc->handle_table().close_handle(handle);
+				if (handle) st->close_handle(cpu, handle);
 				if (t) sys_proc->terminate_thread(t->id());
 			};
 			try

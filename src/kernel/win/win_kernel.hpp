@@ -15,6 +15,7 @@
 #include "filesystem.hpp"
 #include "ethread.hpp"
 #include "thread.hpp"
+#include "execution_mode.hpp"
 #include "thread_notify.hpp"
 #include "process_notify.hpp"
 #include "section_views.hpp"
@@ -40,6 +41,7 @@
 #include <deque>
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 
@@ -47,6 +49,26 @@ struct win_kernel_state : kernel_state
 {
 	[[nodiscard]] std::shared_ptr<windows_process> current_process(vcpu& cpu);
 	[[nodiscard]] std::shared_ptr<windows_process> find_process_by_object(addr_t object);
+	std::uint8_t handle_mode(vcpu& cpu);
+	win_handle_table* select_handle_table(vcpu& cpu, std::uint64_t handle,
+		std::optional<std::uint8_t> mode = std::nullopt);
+	static std::uint64_t local_handle_value(std::uint64_t handle);
+	std::optional<win_handle_table::handle_entry> lookup_handle(vcpu& cpu, std::uint64_t handle,
+		std::optional<std::uint8_t> mode = std::nullopt);
+	template <typename T>
+	std::shared_ptr<T> get_handle_object(vcpu& cpu, std::uint64_t handle,
+		std::optional<std::uint8_t> mode = std::nullopt)
+	{
+		const auto entry = lookup_handle(cpu, handle, mode);
+		return entry ? objs.get_object<T>(entry->body_addr) : nullptr;
+	}
+	std::uint64_t create_handle(vcpu& cpu, addr_t object, std::uint32_t access,
+		std::uint32_t attributes = 0, windows_process* target = nullptr);
+	bool close_handle(vcpu& cpu, std::uint64_t handle,
+		std::optional<std::uint8_t> mode = std::nullopt);
+	win_handle_table* find_handle_table(addr_t address);
+	win_handle_table* find_process_handle_table(addr_t eprocess);
+
 	win_obj_manager objs;
 	win_pool pool;
 	win_registry reg;
@@ -75,7 +97,9 @@ struct win_kernel_state : kernel_state
 	NTSTATUS create_ob_handle(vcpu& cpu, addr_t object, std::uint32_t access,
 		std::uint32_t attributes, emu_object<std::uint64_t> output,
 		std::uint32_t operation = 1, std::uint32_t access_ceiling = 0xffffffff,
-		const std::function<bool(std::uint64_t)>& write_output = {});
+		const std::function<bool(std::uint64_t)>& write_output = {},
+		windows_process* source_process = nullptr, windows_process* target_process = nullptr,
+		std::optional<std::uint8_t> mode = std::nullopt);
 	bool in_lifecycle_callback(std::size_t cpu) const
 	{ return process_notify.in_callback(cpu) || thread_notify.in_callback(cpu) || image_notify.in_callback(cpu) || registry_notify.in_callback(cpu) || ob_notify.in_callback(cpu); }
 	NTSTATUS call_registry_notify(vcpu& cpu, const win::registry_notify_service::record& registration,
@@ -254,7 +278,27 @@ struct win_kernel_state : kernel_state
 		const auto conv = emu_->call_conv();
 
 		const bool bound_nt = try_redirect(mod, nt, make_redirect(conv, fn));
-		const bool bound_zw = try_redirect(mod, zw, make_redirect(conv, fn));
+		// Aliased exports cannot distinguish Nt from Zw: preserve Nt semantics.
+		const auto nt_address = mod.find_symbol(nt), zw_address = mod.find_symbol(zw);
+		const bool bound_zw = zw_address && (nt_address == zw_address ||
+			try_redirect(mod, zw, [handler = make_redirect(conv, fn)](vcpu& cpu) {
+				struct previous_mode_guard
+				{
+					emu_object<char> field;
+					char saved = 0;
+					explicit previous_mode_guard(vcpu& cpu)
+					{
+						if (win::executing_user_mode(cpu)) return;
+						const auto thread = std::dynamic_pointer_cast<win_thread>(cpu.thread());
+						if (!thread || !thread->ethread()) return;
+						field = thread->ethread().field(&_ETHREAD::Tcb).field(&_KTHREAD::PreviousMode);
+						saved = field.read();
+						field.write(0);
+					}
+					~previous_mode_guard() { if (field) field.write(saved); }
+				} guard(cpu);
+				handler(cpu);
+			}));
 
 		if (!bound_nt && !bound_zw)
 			LOG_ERR("neither {} nor {} is in {}", nt, zw, mod.name);
@@ -585,9 +629,11 @@ struct win_kernel_state : kernel_state
 	std::shared_ptr<process> create_process(std::string_view name) override;
 
 private:
+	// Process objects and exposed table storage outlive removal from processes.
+	std::unordered_map<addr_t, std::shared_ptr<windows_process>> retained_handle_tables_;
 	windows_emulator* emulator_ = nullptr;
 
-	[[nodiscard]] win_handle_table::handle_t open_console()
+	[[nodiscard]] win_handle_table::handle_t open_console(windows_process& target)
 	{
 		auto host = std::make_shared<file_host>();
 		host->console = true;
@@ -600,7 +646,7 @@ private:
 		if (!addr)
 			return 0;
 
-		return sys_proc->handle_table().create_handle(addr, 0);
+		return target.handle_table().create_handle(addr, 0);
 	}
 
 	// A deque rather than a vector because each block is handed out by pointer as its cpu is added.
@@ -617,10 +663,12 @@ private:
 		std::memcpy(ep.ImageFileName, name.data(), std::min(name.size(), sizeof(ep.ImageFileName)));
 
 		std::scoped_lock lock(list_mtx_);
-		auto obj = active_process_list.push_back(ep);
+		const auto body = objs.create_object(0, &ep, sizeof(ep),
+			std::make_shared<process_identity_object>(), prot_rw | prot_supervisor);
+		if (!body) throw std::runtime_error("EPROCESS allocation failed");
+		auto obj = active_process_list.push_back(ep, body);
 		try
 		{
-			objs.register_object(obj.address(), std::make_shared<process_identity_object>());
 			kprocess_thread_list(space, obj.address(),
 				std::format("KPROCESS.ThreadListHead[pid={}]", id), true).init();
 			eprocess_thread_list(space, obj.address(),
@@ -896,11 +944,28 @@ public:
 		emu_object<_IRP>(space, irp).write(body);
 		emu_object<_IO_STACK_LOCATION>(space, stack_addr).write(stack);
 
-		// Driver code lives in supervisor pages, so the dispatch runs in kernel mode and the
-		// caller's thread goes back to user mode after it.
-		set_kernel_mode(cpu, true);
-		win::call_with_attachment_checkpoint(kernel_.calls, cpu, routine, { { req.device_object, irp } });
-		set_kernel_mode(cpu, false);
+		// Driver code lives in supervisor pages. Save the caller's exact mode before raising
+		// privilege, including when the caller is already executing in kernel mode.
+		{
+			struct mode_guard
+			{
+				vcpu& cpu;
+#if defined(KERNEMUL_ARCH_ARM64)
+				std::uint64_t pstate = cpu.reg<std::uint64_t>(arm64::pstate);
+				~mode_guard() { cpu.reg(arm64::pstate, pstate); }
+#else
+				x86::seg_reg cs = cpu.reg<x86::seg_reg>(x86::cs);
+				x86::seg_reg ss = cpu.reg<x86::seg_reg>(x86::ss);
+				~mode_guard()
+				{
+					cpu.reg(x86::cs, cs);
+					cpu.reg(x86::ss, ss);
+				}
+#endif
+			} guard{cpu};
+			set_kernel_mode(cpu, true);
+			win::call_with_attachment_checkpoint(kernel_.calls, cpu, routine, { { req.device_object, irp } });
+		}
 
 		const emu_object<_IRP> done(space, irp);
 		const auto io_status = done.field(&_IRP::IoStatus).read();
@@ -971,7 +1036,7 @@ inline std::shared_ptr<process> win_kernel_state::create_process(const std::stri
 		if (active_process_list.address())
 			proc->set_eprocess(insert_process(kspace, id,
 				name.substr(name.find_last_of("\\/") + 1), proc->peb().address()));
-		proc->owned_console = open_console();
+		proc->owned_console = open_console(*proc);
 		proc->set_std_handles(proc->owned_console, proc->owned_console, proc->owned_console);
 		std::unique_lock lock(proc_mtx_);
 		processes[id] = proc;

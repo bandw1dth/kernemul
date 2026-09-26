@@ -108,9 +108,9 @@ void modules::register_ntoskrnl_wait_ops(win_kernel_state& state, proc_module& m
 				"KeWaitForMultipleObjects");
 		});
 
-	auto object_of = [st](const std::uint64_t handle) -> addr_t
+	auto object_of = [st](vcpu& cpu, const std::uint64_t handle) -> addr_t
 	{
-		const auto entry = st->sys_proc->handle_table().lookup_handle(handle);
+		const auto entry = st->lookup_handle(cpu, handle);
 
 		return entry ? entry->body_addr : 0;
 	};
@@ -119,7 +119,7 @@ void modules::register_ntoskrnl_wait_ops(win_kernel_state& state, proc_module& m
 		[begin_wait, object_of](vcpu& cpu, const std::uint64_t handle, const bool alertable,
 			emu_object<std::int64_t> timeout) -> NTSTATUS
 		{
-			const auto object = object_of(handle);
+			const auto object = object_of(cpu, handle);
 
 			if (!object)
 			{
@@ -150,7 +150,7 @@ void modules::register_ntoskrnl_wait_ops(win_kernel_state& state, proc_module& m
 				const auto handle = space.read_mem<std::uint64_t>(
 					handle_array + i * sizeof(std::uint64_t));
 
-				objects[i] = object_of(handle);
+				objects[i] = object_of(cpu, handle);
 
 				if (!objects[i])
 				{
@@ -173,8 +173,8 @@ void modules::register_ntoskrnl_wait_ops(win_kernel_state& state, proc_module& m
 			const std::uint64_t wait_handle, const bool alertable,
 			emu_object<std::int64_t> timeout) -> NTSTATUS
 		{
-			const auto signal = object_of(signal_handle);
-			const auto object = object_of(wait_handle);
+			const auto signal = object_of(cpu, signal_handle);
+			const auto object = object_of(cpu, wait_handle);
 
 			if (!signal || !object)
 				return STATUS_INVALID_HANDLE;

@@ -73,7 +73,9 @@ versions. Do not load the unsigned fixture into the host as part of this workflo
    [object handle notifications](object-handle-notifications.md). Registry
    value set/query/delete now have a filtering pipeline; see
    [registry notifications](registry-notifications.md) for scope and contracts.
-3. Coherent process-local handles and guest EPROCESS.ObjectTable representation.
+3. Extend [process-local handles and EPROCESS.ObjectTable](process-handle-tables.md)
+   beyond the bounded table model: inheritance, blocking rundown, and process-exit
+   device cleanup remain follow-on work.
 4. Memory invariants across MMU, PFN, MDL, allocations, and guest-visible metadata.
 5. Build-pinned CI verification contracts, fixtures, and policy behavior.
 6. Versioned firmware/storage machine profiles and explicit device/IRP completion.

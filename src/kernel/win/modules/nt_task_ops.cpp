@@ -116,7 +116,7 @@ std::shared_ptr<win_thread> thread_from_handle(win_kernel_state& state, vcpu& cp
 	if (handle == current_thread_handle)
 		return std::dynamic_pointer_cast<win_thread>(cpu.thread());
 
-	const auto entry = state.sys_proc->handle_table().lookup_handle(handle);
+	const auto entry = state.lookup_handle(cpu, handle);
 
 	if (!entry)
 		return {};
@@ -519,13 +519,15 @@ void modules::register_ntoskrnl_task_ops(win_kernel_state& state, proc_module& m
 		const std::uint32_t process_information_class, const addr_t process_information,
 		const std::uint32_t length, emu_object<std::uint32_t> return_length) -> NTSTATUS
 	{
+		auto process = st->current_process(cpu);
 		if (process_handle != 0 && process_handle != current_process_handle)
 		{
-			const auto entry = st->sys_proc->handle_table().lookup_handle(process_handle);
-
-			if (!entry)
-				return STATUS_INVALID_HANDLE;
+			const auto entry = st->lookup_handle(cpu, process_handle);
+			if (!entry) return STATUS_INVALID_HANDLE;
+			process = st->find_process_by_object(entry->body_addr);
+			if (!process) return STATUS_OBJECT_TYPE_MISMATCH;
 		}
+		if (!process) return STATUS_INVALID_HANDLE;
 
 		auto& space = *cpu.curr_addr_space();
 
@@ -540,14 +542,14 @@ void modules::register_ntoskrnl_task_ops(win_kernel_state& state, proc_module& m
 				return STATUS_INFO_LENGTH_MISMATCH;
 
 			process_basic_information_t info{};
-			info.unique_process_id = st->sys_proc->id();
+			info.unique_process_id = process->id();
 			info.affinity_mask = 1;
 			info.base_priority = 8;
 
 			emu_object<process_basic_information_t>(space, process_information).write(info);
 
 			THREAD_LOG_INFO("NtQueryInformationProcess(ProcessBasicInformation) -> pid={}",
-				st->sys_proc->id());
+				process->id());
 
 			return STATUS_SUCCESS;
 		}

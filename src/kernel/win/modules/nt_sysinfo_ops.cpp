@@ -924,39 +924,74 @@ void modules::register_ntoskrnl_sysinfo_ops(win_kernel_state& state, proc_module
 			const std::uint32_t handle_attributes, const std::uint32_t options) -> NTSTATUS
 		{
             if (st->ob_notify.in_callback(cpu.id())) st->fail_ob_notify(cpu, "nested handle operations are unsupported");
-			constexpr std::uint32_t duplicate_close_source = 0x1;
-			constexpr std::uint32_t duplicate_same_access = 0x2;
-
-			if (source_process_handle != current_process_handle
-				|| target_process_handle != current_process_handle)
+			constexpr std::uint32_t duplicate_close_source = 1, duplicate_same_access = 2;
+			if (options & ~7u) return STATUS_INVALID_PARAMETER;
+			auto resolve_process = [&](std::uint64_t handle, std::shared_ptr<windows_process>& process) -> NTSTATUS
 			{
-				THREAD_LOG_WARN("NtDuplicateObject: there is one process here, so a handle can "
-					"only be duplicated within it");
-				return STATUS_INVALID_HANDLE;
+				if (handle == current_process_handle)
+				{
+					process = st->current_process(cpu);
+					return process ? STATUS_SUCCESS : STATUS_INVALID_HANDLE;
+				}
+				const auto entry = st->lookup_handle(cpu, handle);
+				if (!entry) return STATUS_INVALID_HANDLE;
+				process = st->find_process_by_object(entry->body_addr);
+				if (!process) return STATUS_OBJECT_TYPE_MISMATCH;
+				return (entry->access & 0x40u) ? STATUS_SUCCESS : STATUS_ACCESS_DENIED;
+			};
+			std::shared_ptr<windows_process> source, target;
+			auto status = resolve_process(source_process_handle, source);
+			if (status != STATUS_SUCCESS) return status;
+			if (target_process_handle)
+			{
+				status = resolve_process(target_process_handle, target);
+				if (status != STATUS_SUCCESS) return status;
 			}
+			else if (!(options & duplicate_close_source)) return STATUS_INVALID_PARAMETER;
 
-			auto& handles = st->sys_proc->handle_table();
-			const auto entry = handles.lookup_handle(source_handle);
+			// Kernel handles live in System; ordinary values are relative to the explicit source.
+			auto* handles = st->select_handle_table(cpu, source_handle);
+			if (!handles) return STATUS_INVALID_HANDLE;
+			const auto local = st->local_handle_value(source_handle);
+			if (source_handle == local) handles = &source->handle_table();
+			const auto entry = handles->lookup_handle(local);
+			if (!entry) return STATUS_INVALID_HANDLE;
+			if ((options & duplicate_close_source) && (entry->attributes & 1u))
+				return static_cast<NTSTATUS>(0xC0000235); // STATUS_HANDLE_NOT_CLOSABLE
 
-			if (!entry)
-				return STATUS_INVALID_HANDLE;
-
-			const auto access = (options & duplicate_same_access) ? entry->access : desired_access;
-
-            if (options & ~7u) return STATUS_INVALID_PARAMETER;
-            const auto attributes = (options & 4u) ? entry->attributes : handle_attributes;
-            const auto status = st->create_ob_handle(cpu, entry->body_addr, access, attributes,
-                target_handle, 2, entry->access);
-            if (status != STATUS_SUCCESS) return status;
-            if (options & duplicate_close_source) handles.close_handle(source_handle);
-
-			return STATUS_SUCCESS;
+			status = STATUS_SUCCESS;
+			if (target)
+			{
+				const auto access = (options & duplicate_same_access) ? entry->access : desired_access;
+				const auto attributes = (options & 4u) ? entry->attributes : handle_attributes;
+				status = st->create_ob_handle(cpu, entry->body_addr, access, attributes,
+					target_handle, 2, entry->access, {}, source.get(), target.get());
+			}
+			// CLOSE_SOURCE also applies when creating the destination fails.
+			if (options & duplicate_close_source)
+			{
+				const auto host = st->objs.get_object<file_host>(entry->body_addr);
+				std::unique_lock<std::mutex> close_lock;
+				if (host && host->is_device()) close_lock = std::unique_lock(host->close_mutex);
+				if (!handles->close_handle(local)) return STATUS_INVALID_HANDLE;
+				if (host && host->is_device() && host->file_object
+					&& st->objs.header_of(entry->body_addr).read().HandleCount == 0)
+				{
+					if (auto* emulator = st->emulator())
+						for (const auto major : {irp_mj_cleanup, irp_mj_close})
+							emulator->dispatch_irp(cpu, {.major = major, .device_object = host->device_object,
+								.file_object = host->file_object});
+					st->pool.free(host->file_object);
+					host->file_object = 0;
+				}
+			}
+			return status;
 		});
 
 	// Nothing here puts an object in the namespace, so every object is already temporary.
-	auto make_temporary = [st](vcpu&, const std::uint64_t handle) -> NTSTATUS
+	auto make_temporary = [st](vcpu& cpu, const std::uint64_t handle) -> NTSTATUS
 	{
-		if (!st->sys_proc->handle_table().lookup_handle(handle))
+		if (!st->lookup_handle(cpu, handle))
 			return STATUS_INVALID_HANDLE;
 
 		THREAD_LOG_INFO("NtMakeTemporaryObject(0x{:X}): nothing here is permanent", handle);

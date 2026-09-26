@@ -76,14 +76,25 @@ void modules::register_ntoskrnl_timer_ops(win_kernel_state& state, proc_module& 
         const auto addr = st->objs.create_object(0, &zero, sizeof(zero), {}, prot_rw | prot_supervisor);
         if (!addr) return STATUS_INSUFFICIENT_RESOURCES;
         init_timer(emu_object<_KTIMER>(*cpu.curr_addr_space(), addr), attributes & 1);
-        { std::scoped_lock lock(st->timer_mutex); timer2->insert(addr); }
-        handle.write(st->sys_proc->handle_table().create_handle(addr, access));
+        const auto created = st->create_handle(cpu, addr, access);
+        if (!created) return STATUS_INSUFFICIENT_RESOURCES;
+        try
+        {
+            { std::scoped_lock lock(st->timer_mutex); timer2->insert(addr); }
+            handle.write(created);
+        }
+        catch (...)
+        {
+            { std::scoped_lock lock(st->timer_mutex); timer2->erase(addr); }
+            st->close_handle(cpu, created, 0);
+            return STATUS_ACCESS_VIOLATION;
+        }
         return STATUS_SUCCESS;
     });
     state.redirect_ntzw(mod, "SetTimer2", [st, timer2](vcpu& cpu, std::uint64_t handle,
         emu_object<std::int64_t> due, emu_object<std::int64_t> period, addr_t parameters) -> NTSTATUS {
         std::scoped_lock lock(st->timer_mutex);
-        const auto entry = st->sys_proc->handle_table().lookup_handle(handle);
+        const auto entry = st->lookup_handle(cpu, handle);
         if (!entry) return STATUS_INVALID_HANDLE;
         if (!timer2->contains(entry->body_addr)) return STATUS_OBJECT_TYPE_MISMATCH;
         if (!due) return STATUS_INVALID_PARAMETER;
@@ -96,10 +107,10 @@ void modules::register_ntoskrnl_timer_ops(win_kernel_state& state, proc_module& 
             due.read(), static_cast<std::uint64_t>(interval), 0);
         return STATUS_SUCCESS;
     });
-    state.redirect_ntzw(mod, "CancelTimer2", [st, timer2](vcpu&, std::uint64_t handle,
+    state.redirect_ntzw(mod, "CancelTimer2", [st, timer2](vcpu& cpu, std::uint64_t handle,
         addr_t parameters) -> NTSTATUS {
         std::scoped_lock lock(st->timer_mutex);
-        const auto entry = st->sys_proc->handle_table().lookup_handle(handle);
+        const auto entry = st->lookup_handle(cpu, handle);
         if (!entry) return STATUS_INVALID_HANDLE;
         if (!timer2->contains(entry->body_addr)) return STATUS_OBJECT_TYPE_MISMATCH;
         if (parameters) return STATUS_NOT_SUPPORTED;

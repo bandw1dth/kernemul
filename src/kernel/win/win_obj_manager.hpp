@@ -42,11 +42,14 @@ public:
 
 	// Nothing here builds \Device or \BaseNamedObjects up front.
 	void register_named_object(std::string name, addr_t body_addr);
+	// Publication and rollback must not replace/remove a concurrent creator's object.
+	bool try_register_named_object(std::string name, addr_t body_addr);
 
 	[[nodiscard]] addr_t lookup_named_object(std::string_view name) const;
 
 	// The name goes, the object stays: whoever still holds a handle to it keeps working.
 	void unregister_named_object(std::string_view name);
+	bool unregister_named_object(std::string_view name, addr_t expected_body);
 
 	template <typename T>
 	[[nodiscard]] std::shared_ptr<T> get_object(addr_t body_addr) const
@@ -62,7 +65,7 @@ public:
 
 	[[nodiscard]] emu_object<_OBJECT_HEADER> header_of(addr_t body_addr) const
 	{
-		return emu_object<_OBJECT_HEADER>(space_, body_addr - sizeof(_OBJECT_HEADER));
+		return emu_object<_OBJECT_HEADER>(space_, body_addr - offsetof(_OBJECT_HEADER, Body));
 	}
 
 	void reference_object(addr_t body_addr);

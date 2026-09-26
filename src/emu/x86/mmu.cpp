@@ -433,6 +433,7 @@ std::optional<addr_t> mmu::phys_to_virt(const ::addr_space& space, addr_t pa)
 
 addr_t addr_space::alloc(std::size_t size, mem_prot prot)
 {
+	std::lock_guard lk(alloc_mtx_);
 	constexpr std::size_t page = 0x1000;
 	auto aligned = (size + page - 1) & ~(page - 1);
 
@@ -446,6 +447,7 @@ addr_t addr_space::alloc(std::size_t size, mem_prot prot)
 
 addr_t addr_space::map_phys(const addr_t pa, const std::size_t size, const mem_prot prot)
 {
+	std::lock_guard lk(alloc_mtx_);
 	constexpr std::size_t page = 0x1000;
 	const auto aligned = (size + page - 1) & ~(page - 1);
 

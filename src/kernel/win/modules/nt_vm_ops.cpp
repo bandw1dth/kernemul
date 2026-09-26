@@ -180,7 +180,7 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 		if (handle == current_process_handle) remote = caller;
 		else
 		{
-			const auto entry = st->sys_proc->handle_table().lookup_handle(handle);
+			const auto entry = st->lookup_handle(cpu, handle, user ? 1 : 0);
 			if (!entry) return STATUS_INVALID_HANDLE;
 			if (user && (entry->attributes & 0x200u)) return STATUS_INVALID_HANDLE;
 			remote = st->find_process_by_object(entry->body_addr);
@@ -592,6 +592,7 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 		return STATUS_SUCCESS;
 	};
 
+	// Section names remain ObjectName-only; RootDirectory-relative paths are unsupported.
 	auto create_section = [st](vcpu& cpu, emu_object<std::uint64_t> section_handle,
 		const std::uint32_t desired_access, emu_object<_OBJECT_ATTRIBUTES> object_attributes,
 		emu_object<std::int64_t> maximum_size, const std::uint32_t section_page_protection,
@@ -615,7 +616,7 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 
 		if (file_handle)
 		{
-			const auto file = st->sys_proc->handle_table().get_object<file_host>(file_handle);
+			const auto file = st->get_handle_object<file_host>(cpu, file_handle);
 
 			if (!file)
 				return STATUS_INVALID_HANDLE;
@@ -652,8 +653,16 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 		if (!addr)
 			return STATUS_INSUFFICIENT_RESOURCES;
 
-		const auto handle = st->sys_proc->handle_table().create_handle(addr, desired_access);
-		section_handle.write(handle);
+		const auto handle = st->create_handle(cpu, addr, desired_access,
+			object_attributes ? object_attributes.field(&_OBJECT_ATTRIBUTES::Attributes).read() : 0);
+		if (!handle)
+			return STATUS_INSUFFICIENT_RESOURCES;
+		try { section_handle.write(handle); }
+		catch (...)
+		{
+			st->close_handle(cpu, handle, 0);
+			return STATUS_ACCESS_VIOLATION;
+		}
 
 		THREAD_LOG_INFO("NtCreateSection('{}', file=0x{:X}, max_size={}, protection=0x{:X}, "
 			"allocation=0x{:X}) -> handle=0x{:X} ({} bytes)",
@@ -667,8 +676,8 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 		const std::uint32_t desired_access,
 		emu_object<_OBJECT_ATTRIBUTES> object_attributes) -> NTSTATUS
 	{
-		if (section_handle)
-			section_handle.write(0);
+		if (!section_handle)
+			return STATUS_INVALID_PARAMETER;
 
 		auto& space = *cpu.curr_addr_space();
 
@@ -695,10 +704,17 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 			if (!addr)
 				return STATUS_INSUFFICIENT_RESOURCES;
 
-			const auto handle = st->sys_proc->handle_table().create_handle(addr, desired_access);
+			const auto handle = st->create_handle(cpu, addr, desired_access,
+				object_attributes ? object_attributes.field(&_OBJECT_ATTRIBUTES::Attributes).read() : 0);
+			if (!handle)
+				return STATUS_INSUFFICIENT_RESOURCES;
 
-			if (section_handle)
-				section_handle.write(handle);
+			try { section_handle.write(handle); }
+			catch (...)
+			{
+				st->close_handle(cpu, handle, 0);
+				return STATUS_ACCESS_VIOLATION;
+			}
 
 			THREAD_LOG_INFO("NtOpenSection('{}') -> handle=0x{:X} ({} bytes)",
 				name, handle, size);
@@ -717,7 +733,7 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 		const std::uint64_t section_information_length,
 		emu_object<std::uint64_t> return_length) -> NTSTATUS
 	{
-		const auto host = st->sys_proc->handle_table().get_object<section_host>(section_handle);
+		const auto host = st->get_handle_object<section_host>(cpu, section_handle);
 
 		if (!host)
 			return STATUS_INVALID_HANDLE;
@@ -759,7 +775,7 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 			if (!is_current_process(process_handle))
 				return STATUS_INVALID_HANDLE;
 
-			const auto host = st->sys_proc->handle_table().get_object<section_host>(section_handle);
+			const auto host = st->get_handle_object<section_host>(cpu, section_handle);
 
 			if (!host)
 				return STATUS_INVALID_HANDLE;

@@ -144,6 +144,7 @@ struct worker_factory_basic_information_t
 // The four bytes before start_routine are an alignment hole, so the size pins the tail down.
 static_assert(sizeof(worker_factory_basic_information_t) == 0x70);
 
+// These names do not resolve RootDirectory-relative object paths.
 std::string attribute_name(vcpu& cpu, const emu_object<_OBJECT_ATTRIBUTES>& object_attributes)
 {
 	auto& space = *cpu.curr_addr_space();
@@ -162,9 +163,9 @@ void modules::register_ntoskrnl_iocp_ops(win_kernel_state& state, proc_module& m
 {
 	auto* st = &state;
 
-	auto port_from_handle = [st](const std::uint64_t handle)
+	auto port_from_handle = [st](vcpu& cpu, const std::uint64_t handle)
 	{
-		return st->sys_proc->handle_table().get_object<io_completion_host>(handle);
+		return st->get_handle_object<io_completion_host>(cpu, handle);
 	};
 
 	state.redirect_ntzw(mod, "CreateIoCompletion",
@@ -203,8 +204,16 @@ void modules::register_ntoskrnl_iocp_ops(win_kernel_state& state, proc_module& m
 			if (!host->name.empty())
 				st->objs.register_named_object(host->name, addr);
 
-			const auto handle = st->sys_proc->handle_table().create_handle(addr, desired_access);
-			handle_out.write(handle);
+			const auto handle = st->create_handle(cpu, addr, desired_access,
+				object_attributes ? object_attributes.field(&_OBJECT_ATTRIBUTES::Attributes).read() : 0);
+			if (!handle)
+				return STATUS_INSUFFICIENT_RESOURCES;
+			try { handle_out.write(handle); }
+			catch (...)
+			{
+				st->close_handle(cpu, handle, 0);
+				return STATUS_ACCESS_VIOLATION;
+			}
 
 			THREAD_LOG_INFO("NtCreateIoCompletion('{}', threads={}) -> handle=0x{:X}",
 				host->name, concurrent_threads, handle);
@@ -216,7 +225,7 @@ void modules::register_ntoskrnl_iocp_ops(win_kernel_state& state, proc_module& m
 		const addr_t key_context, const addr_t apc_context, const NTSTATUS status,
 		const std::uint64_t information) -> NTSTATUS
 	{
-		const auto port = port_from_handle(handle);
+		const auto port = port_from_handle(cpu, handle);
 
 		if (!port)
 		{
@@ -245,7 +254,7 @@ void modules::register_ntoskrnl_iocp_ops(win_kernel_state& state, proc_module& m
 			const addr_t apc_context, const NTSTATUS status,
 			const std::uint64_t information) -> NTSTATUS
 		{
-			if (!st->sys_proc->handle_table().get_object<wait_packet_host>(packet_handle))
+			if (!st->get_handle_object<wait_packet_host>(cpu, packet_handle))
 			{
 				THREAD_LOG_WARN("NtSetIoCompletionEx: handle 0x{:X} is not a wait completion "
 					"packet", packet_handle);
@@ -261,7 +270,7 @@ void modules::register_ntoskrnl_iocp_ops(win_kernel_state& state, proc_module& m
 			emu_object<_IO_STATUS_BLOCK> io_status_block,
 			emu_object<std::int64_t> timeout) -> NTSTATUS
 		{
-			const auto port = port_from_handle(handle);
+			const auto port = port_from_handle(cpu, handle);
 
 			if (!port)
 			{
@@ -308,7 +317,7 @@ void modules::register_ntoskrnl_iocp_ops(win_kernel_state& state, proc_module& m
 			emu_object<std::uint32_t> removed_out, emu_object<std::int64_t> timeout,
 			const bool alertable) -> NTSTATUS
 		{
-			const auto port = port_from_handle(handle);
+			const auto port = port_from_handle(cpu, handle);
 
 			if (!port)
 			{
@@ -373,8 +382,16 @@ void modules::register_ntoskrnl_iocp_ops(win_kernel_state& state, proc_module& m
 			if (!addr)
 				return STATUS_INSUFFICIENT_RESOURCES;
 
-			const auto handle = st->sys_proc->handle_table().create_handle(addr, desired_access);
-			handle_out.write(handle);
+			const auto handle = st->create_handle(cpu, addr, desired_access,
+				object_attributes ? object_attributes.field(&_OBJECT_ATTRIBUTES::Attributes).read() : 0);
+			if (!handle)
+				return STATUS_INSUFFICIENT_RESOURCES;
+			try { handle_out.write(handle); }
+			catch (...)
+			{
+				st->close_handle(cpu, handle, 0);
+				return STATUS_ACCESS_VIOLATION;
+			}
 
 			THREAD_LOG_INFO("NtCreateWaitCompletionPacket('{}') -> handle=0x{:X}",
 				attribute_name(cpu, object_attributes), handle);
@@ -389,8 +406,8 @@ void modules::register_ntoskrnl_iocp_ops(win_kernel_state& state, proc_module& m
 			const std::uint64_t information, emu_object<std::uint8_t> already_signalled) -> NTSTATUS
 		{
 			const auto packet =
-				st->sys_proc->handle_table().get_object<wait_packet_host>(packet_handle);
-			const auto port = port_from_handle(port_handle);
+				st->get_handle_object<wait_packet_host>(cpu, packet_handle);
+			const auto port = port_from_handle(cpu, port_handle);
 
 			if (!packet || !port)
 			{
@@ -399,7 +416,7 @@ void modules::register_ntoskrnl_iocp_ops(win_kernel_state& state, proc_module& m
 				return STATUS_INVALID_HANDLE;
 			}
 
-			const auto target = st->sys_proc->handle_table().lookup_handle(target_handle);
+			const auto target = st->lookup_handle(cpu, target_handle);
 
 			if (!target)
 			{
@@ -439,11 +456,11 @@ void modules::register_ntoskrnl_iocp_ops(win_kernel_state& state, proc_module& m
 		});
 
 	state.redirect_ntzw(mod, "CancelWaitCompletionPacket",
-		[st](vcpu&, const std::uint64_t packet_handle,
+		[st](vcpu& cpu, const std::uint64_t packet_handle,
 			const bool remove_signalled_packet) -> NTSTATUS
 		{
 			const auto packet =
-				st->sys_proc->handle_table().get_object<wait_packet_host>(packet_handle);
+				st->get_handle_object<wait_packet_host>(cpu, packet_handle);
 
 			if (!packet)
 			{
@@ -479,7 +496,7 @@ void modules::register_ntoskrnl_iocp_ops(win_kernel_state& state, proc_module& m
 			if (!handle_out || !start_routine)
 				return STATUS_INVALID_PARAMETER;
 
-			auto port = port_from_handle(completion_port_handle);
+			auto port = port_from_handle(cpu, completion_port_handle);
 
 			if (!port)
 			{
@@ -501,8 +518,16 @@ void modules::register_ntoskrnl_iocp_ops(win_kernel_state& state, proc_module& m
 			if (!addr)
 				return STATUS_INSUFFICIENT_RESOURCES;
 
-			const auto handle = st->sys_proc->handle_table().create_handle(addr, desired_access);
-			handle_out.write(handle);
+			const auto handle = st->create_handle(cpu, addr, desired_access,
+				object_attributes ? object_attributes.field(&_OBJECT_ATTRIBUTES::Attributes).read() : 0);
+			if (!handle)
+				return STATUS_INSUFFICIENT_RESOURCES;
+			try { handle_out.write(handle); }
+			catch (...)
+			{
+				st->close_handle(cpu, handle, 0);
+				return STATUS_ACCESS_VIOLATION;
+			}
 
 			THREAD_LOG_WARN("NtCreateWorkerFactory('{}', start=0x{:X}, parameter=0x{:X}, "
 				"threads={}) -> handle=0x{:X}: nothing here runs pool threads, so the start "
@@ -513,17 +538,17 @@ void modules::register_ntoskrnl_iocp_ops(win_kernel_state& state, proc_module& m
 			return STATUS_SUCCESS;
 		});
 
-	auto factory_from_handle = [st](const std::uint64_t handle)
+	auto factory_from_handle = [st](vcpu& cpu, const std::uint64_t handle)
 	{
-		return st->sys_proc->handle_table().get_object<worker_factory_host>(handle);
+		return st->get_handle_object<worker_factory_host>(cpu, handle);
 	};
 
 	state.redirect_ntzw(mod, "SetInformationWorkerFactory",
-		[factory_from_handle](vcpu&, const std::uint64_t handle,
+		[factory_from_handle](vcpu& cpu, const std::uint64_t handle,
 			const std::uint32_t information_class, const addr_t buffer,
 			const std::uint32_t length) -> NTSTATUS
 		{
-			const auto factory = factory_from_handle(handle);
+			const auto factory = factory_from_handle(cpu, handle);
 
 			if (!factory)
 				return STATUS_INVALID_HANDLE;
@@ -540,7 +565,7 @@ void modules::register_ntoskrnl_iocp_ops(win_kernel_state& state, proc_module& m
 			const std::uint32_t information_class, const addr_t buffer,
 			const std::uint32_t length, emu_object<std::uint32_t> return_length) -> NTSTATUS
 		{
-			const auto factory = factory_from_handle(handle);
+			const auto factory = factory_from_handle(cpu, handle);
 
 			if (!factory)
 				return STATUS_INVALID_HANDLE;
@@ -573,10 +598,10 @@ void modules::register_ntoskrnl_iocp_ops(win_kernel_state& state, proc_module& m
 			return STATUS_SUCCESS;
 		});
 
-	auto worker_call = [factory_from_handle](const std::uint64_t handle,
+	auto worker_call = [factory_from_handle](vcpu& cpu, const std::uint64_t handle,
 		const std::string_view who) -> NTSTATUS
 	{
-		const auto factory = factory_from_handle(handle);
+		const auto factory = factory_from_handle(cpu, handle);
 
 		if (!factory)
 		{
@@ -597,22 +622,22 @@ void modules::register_ntoskrnl_iocp_ops(win_kernel_state& state, proc_module& m
 	};
 
 	state.redirect_ntzw(mod, "WorkerFactoryWorkerReady",
-		[worker_call](vcpu&, const std::uint64_t handle) -> NTSTATUS
+		[worker_call](vcpu& cpu, const std::uint64_t handle) -> NTSTATUS
 		{
-			return worker_call(handle, "NtWorkerFactoryWorkerReady");
+			return worker_call(cpu, handle, "NtWorkerFactoryWorkerReady");
 		});
 
 	state.redirect_ntzw(mod, "ReleaseWorkerFactoryWorker",
-		[worker_call](vcpu&, const std::uint64_t handle) -> NTSTATUS
+		[worker_call](vcpu& cpu, const std::uint64_t handle) -> NTSTATUS
 		{
-			return worker_call(handle, "NtReleaseWorkerFactoryWorker");
+			return worker_call(cpu, handle, "NtReleaseWorkerFactoryWorker");
 		});
 
 	state.redirect_ntzw(mod, "ShutdownWorkerFactory",
-		[factory_from_handle](vcpu&, const std::uint64_t handle,
+		[factory_from_handle](vcpu& cpu, const std::uint64_t handle,
 			emu_object<std::int32_t> pending_worker_count) -> NTSTATUS
 		{
-			const auto factory = factory_from_handle(handle);
+			const auto factory = factory_from_handle(cpu, handle);
 
 			if (!factory)
 				return STATUS_INVALID_HANDLE;

@@ -30,8 +30,8 @@ struct event_basic_information_t
 #pragma pack(pop)
 
 template <typename T>
-std::uint64_t create_dispatcher(win_kernel_state& state, const win::dispatcher_type type,
-	const std::int32_t signal_state, const std::uint32_t access, std::string name)
+std::uint64_t create_dispatcher(win_kernel_state& state, vcpu& cpu, const win::dispatcher_type type,
+	const std::int32_t signal_state, const std::uint32_t access, std::string name, const std::uint32_t attributes)
 {
 	const T zeroed{};
 	const auto addr = state.objs.create_object(0, &zeroed, sizeof(T),
@@ -43,7 +43,7 @@ std::uint64_t create_dispatcher(win_kernel_state& state, const win::dispatcher_t
 	emu_object<T> obj(*state.emulator()->emu().default_addr_space(), addr);
 	win::init_dispatcher(obj, type, signal_state);
 
-	return state.sys_proc->handle_table().create_handle(addr, access);
+	return state.create_handle(cpu, addr, access, attributes);
 }
 
 struct resolved
@@ -52,10 +52,10 @@ struct resolved
 	std::shared_ptr<dispatcher_host> host;
 };
 
-resolved resolve(win_kernel_state& state, const std::uint64_t handle,
+resolved resolve(win_kernel_state& state, vcpu& cpu, const std::uint64_t handle,
 	const win::dispatcher_type expected, const std::string_view who)
 {
-	const auto entry = state.sys_proc->handle_table().lookup_handle(handle);
+	const auto entry = state.lookup_handle(cpu, handle);
 
 	if (!entry)
 	{
@@ -131,6 +131,7 @@ private:
 	std::unordered_map<addr_t, gate> gates_;
 };
 
+// These names do not resolve RootDirectory-relative object paths.
 std::string attribute_name(vcpu& cpu, const emu_object<_OBJECT_ATTRIBUTES>& object_attributes)
 {
 	auto& space = *cpu.curr_addr_space();
@@ -160,13 +161,19 @@ void modules::register_ntoskrnl_dispatch_ops(win_kernel_state& state, proc_modul
 		const auto type = event_type == notification_event
 			? win::event_notification_object : win::event_synchronization_object;
 
-		const auto handle = create_dispatcher<_KEVENT>(*st, type, initial_state ? 1 : 0,
-			desired_access, name);
+		const auto handle = create_dispatcher<_KEVENT>(*st, cpu, type, initial_state ? 1 : 0,
+			desired_access, name,
+			object_attributes ? object_attributes.field(&_OBJECT_ATTRIBUTES::Attributes).read() : 0);
 
 		if (!handle)
 			return STATUS_INSUFFICIENT_RESOURCES;
 
-		event_handle.write(handle);
+		try { event_handle.write(handle); }
+		catch (...)
+		{
+			st->close_handle(cpu, handle, 0);
+			return STATUS_ACCESS_VIOLATION;
+		}
 
 		THREAD_LOG_INFO("NtCreateEvent('{}', {}, state={}) -> handle=0x{:X}",
 			name, event_type == notification_event ? "notification" : "synchronization",
@@ -192,7 +199,7 @@ void modules::register_ntoskrnl_dispatch_ops(win_kernel_state& state, proc_modul
 	auto set_event = [st](vcpu& cpu, const std::uint64_t event_handle,
 		emu_object<std::int32_t> previous_state) -> NTSTATUS
 	{
-		const auto found = resolve(*st, event_handle, win::event_notification_object, "NtSetEvent");
+		const auto found = resolve(*st, cpu, event_handle, win::event_notification_object, "NtSetEvent");
 
 		if (!found.address)
 			return STATUS_INVALID_HANDLE;
@@ -215,7 +222,7 @@ void modules::register_ntoskrnl_dispatch_ops(win_kernel_state& state, proc_modul
 	auto reset_event = [st](vcpu& cpu, const std::uint64_t event_handle,
 		emu_object<std::int32_t> previous_state) -> NTSTATUS
 	{
-		const auto found = resolve(*st, event_handle, win::event_notification_object,
+		const auto found = resolve(*st, cpu, event_handle, win::event_notification_object,
 			"NtResetEvent");
 
 		if (!found.address)
@@ -236,7 +243,7 @@ void modules::register_ntoskrnl_dispatch_ops(win_kernel_state& state, proc_modul
 
 	auto clear_event = [st](vcpu& cpu, const std::uint64_t event_handle) -> NTSTATUS
 	{
-		const auto found = resolve(*st, event_handle, win::event_notification_object,
+		const auto found = resolve(*st, cpu, event_handle, win::event_notification_object,
 			"NtClearEvent");
 
 		if (!found.address)
@@ -254,7 +261,7 @@ void modules::register_ntoskrnl_dispatch_ops(win_kernel_state& state, proc_modul
 		const std::uint32_t event_information_class, const addr_t event_information,
 		const std::uint32_t length, emu_object<std::uint32_t> return_length) -> NTSTATUS
 	{
-		const auto found = resolve(*st, event_handle, win::event_notification_object,
+		const auto found = resolve(*st, cpu, event_handle, win::event_notification_object,
 			"NtQueryEvent");
 
 		if (!found.address)
@@ -298,18 +305,25 @@ void modules::register_ntoskrnl_dispatch_ops(win_kernel_state& state, proc_modul
 			return STATUS_INVALID_PARAMETER;
 
 		const auto name = attribute_name(cpu, object_attributes);
-		const auto handle = create_dispatcher<_KSEMAPHORE>(*st, win::semaphore_object,
-			initial_count, desired_access, name);
+		const auto handle = create_dispatcher<_KSEMAPHORE>(*st, cpu, win::semaphore_object,
+			initial_count, desired_access, name,
+			object_attributes ? object_attributes.field(&_OBJECT_ATTRIBUTES::Attributes).read() : 0);
 
 		if (!handle)
 			return STATUS_INSUFFICIENT_RESOURCES;
 
 		// The limit lives past the dispatcher header, and KeReleaseSemaphore checks against it.
-		const auto entry = st->sys_proc->handle_table().lookup_handle(handle);
+		// Internal initialization must also reach a newly created kernel handle.
+		const auto entry = st->lookup_handle(cpu, handle, 0);
 		emu_object<_KSEMAPHORE>(*cpu.curr_addr_space(), entry->body_addr)
 			.field(&_KSEMAPHORE::Limit).write(maximum_count);
 
-		semaphore_handle.write(handle);
+		try { semaphore_handle.write(handle); }
+		catch (...)
+		{
+			st->close_handle(cpu, handle, 0);
+			return STATUS_ACCESS_VIOLATION;
+		}
 
 		THREAD_LOG_INFO("NtCreateSemaphore('{}', initial={}, maximum={}) -> handle=0x{:X}",
 			name, initial_count, maximum_count, handle);
@@ -320,7 +334,7 @@ void modules::register_ntoskrnl_dispatch_ops(win_kernel_state& state, proc_modul
 	auto release_semaphore = [st](vcpu& cpu, const std::uint64_t semaphore_handle,
 		const std::int32_t release_count, emu_object<std::int32_t> previous_count) -> NTSTATUS
 	{
-		const auto found = resolve(*st, semaphore_handle, win::semaphore_object,
+		const auto found = resolve(*st, cpu, semaphore_handle, win::semaphore_object,
 			"NtReleaseSemaphore");
 
 		if (!found.address)
@@ -364,15 +378,17 @@ void modules::register_ntoskrnl_dispatch_ops(win_kernel_state& state, proc_modul
 			return STATUS_INVALID_PARAMETER;
 
 		const auto name = attribute_name(cpu, object_attributes);
-		const auto handle = create_dispatcher<_KMUTANT>(*st, win::mutant_object,
-			initial_owner ? 0 : 1, desired_access, name);
+		const auto handle = create_dispatcher<_KMUTANT>(*st, cpu, win::mutant_object,
+			initial_owner ? 0 : 1, desired_access, name,
+			object_attributes ? object_attributes.field(&_OBJECT_ATTRIBUTES::Attributes).read() : 0);
 
 		if (!handle)
 			return STATUS_INSUFFICIENT_RESOURCES;
 
 		if (initial_owner)
 		{
-			const auto entry = st->sys_proc->handle_table().lookup_handle(handle);
+			// Internal initialization must also reach a newly created kernel handle.
+			const auto entry = st->lookup_handle(cpu, handle, 0);
 			const auto t = std::dynamic_pointer_cast<win_thread>(cpu.thread());
 			const auto ethread = t ? t->ethread().address() : 0;
 
@@ -381,7 +397,12 @@ void modules::register_ntoskrnl_dispatch_ops(win_kernel_state& state, proc_modul
 				.write(guest_ptr<_KTHREAD>(ethread));
 		}
 
-		mutant_handle.write(handle);
+		try { mutant_handle.write(handle); }
+		catch (...)
+		{
+			st->close_handle(cpu, handle, 0);
+			return STATUS_ACCESS_VIOLATION;
+		}
 
 		THREAD_LOG_INFO("NtCreateMutant('{}', initial_owner={}) -> handle=0x{:X}",
 			name, initial_owner, handle);
@@ -392,7 +413,7 @@ void modules::register_ntoskrnl_dispatch_ops(win_kernel_state& state, proc_modul
 	auto release_mutant = [st](vcpu& cpu, const std::uint64_t mutant_handle,
 		emu_object<std::int32_t> previous_count) -> NTSTATUS
 	{
-		const auto found = resolve(*st, mutant_handle, win::mutant_object, "NtReleaseMutant");
+		const auto found = resolve(*st, cpu, mutant_handle, win::mutant_object, "NtReleaseMutant");
 
 		if (!found.address)
 			return STATUS_INVALID_HANDLE;
@@ -434,13 +455,13 @@ void modules::register_ntoskrnl_dispatch_ops(win_kernel_state& state, proc_modul
 
 	auto default_keyed_event = std::make_shared<keyed_event_host>();
 
-	auto keyed_event_from_handle = [st, default_keyed_event](const std::uint64_t handle)
+	auto keyed_event_from_handle = [st, default_keyed_event](vcpu& cpu, const std::uint64_t handle)
 		-> std::shared_ptr<keyed_event_host>
 	{
 		if (!handle)
 			return default_keyed_event;
 
-		return st->sys_proc->handle_table().get_object<keyed_event_host>(handle);
+		return st->get_handle_object<keyed_event_host>(cpu, handle);
 	};
 
 	auto create_keyed_event = [st](vcpu& cpu, emu_object<std::uint64_t> keyed_event_handle,
@@ -466,8 +487,16 @@ void modules::register_ntoskrnl_dispatch_ops(win_kernel_state& state, proc_modul
 		if (!name.empty())
 			st->objs.register_named_object(name, addr);
 
-		const auto handle = st->sys_proc->handle_table().create_handle(addr, desired_access);
-		keyed_event_handle.write(handle);
+		const auto handle = st->create_handle(cpu, addr, desired_access,
+			object_attributes ? object_attributes.field(&_OBJECT_ATTRIBUTES::Attributes).read() : 0);
+		if (!handle)
+			return STATUS_INSUFFICIENT_RESOURCES;
+		try { keyed_event_handle.write(handle); }
+		catch (...)
+		{
+			st->close_handle(cpu, handle, 0);
+			return STATUS_ACCESS_VIOLATION;
+		}
 
 		THREAD_LOG_INFO("NtCreateKeyedEvent('{}') -> handle=0x{:X}", name, handle);
 
@@ -478,7 +507,7 @@ void modules::register_ntoskrnl_dispatch_ops(win_kernel_state& state, proc_modul
 		const addr_t key, const bool alertable, const emu_object<std::int64_t>& timeout,
 		const bool releasing) -> NTSTATUS
 	{
-		const auto host = keyed_event_from_handle(handle);
+		const auto host = keyed_event_from_handle(cpu, handle);
 
 		if (!host)
 		{

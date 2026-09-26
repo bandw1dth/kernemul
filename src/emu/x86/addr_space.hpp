@@ -1,5 +1,6 @@
 #pragma once
 #include "../addr_space.hpp"
+#include <mutex>
 #include <unordered_map>
 
 namespace x86
@@ -25,6 +26,9 @@ namespace x86
 
 		addr_t pml4_pa = 0;
 		std::unordered_map<addr_t, addr_t> shadow;
+		// Hold through mapping, before the MMU lock. MMU operations must never
+		// acquire this lock while holding their own lock.
+		std::mutex alloc_mtx_;
 		addr_t user_next_ = 0x10000;
 		addr_t kernel_next_ = 0xFFFFF80000000000;
 	};

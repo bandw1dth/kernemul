@@ -60,7 +60,7 @@ public:
 	void set_emulator(windows_emulator* e) { emulator_ = e; }
 
 	// Unset when the guest has no view of it -- without ntoskrnl's symbols there is no list.
-	void set_eprocess(emu_object<_EPROCESS> ep) { eprocess_ = std::move(ep); }
+	void set_eprocess(emu_object<_EPROCESS> ep);
 	[[nodiscard]] const emu_object<_EPROCESS>& eprocess() const { return eprocess_; }
 
 	[[nodiscard]] std::shared_ptr<win_file> open_system_image(std::string_view name) const;

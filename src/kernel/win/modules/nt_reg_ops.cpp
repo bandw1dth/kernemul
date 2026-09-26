@@ -352,14 +352,14 @@ std::vector<std::uint8_t> value_response(const std::uint32_t info_class,
 	}
 }
 
-std::shared_ptr<registry_key_host> key_from_handle(win_kernel_state& state,
+std::shared_ptr<registry_key_host> key_from_handle(win_kernel_state& state, vcpu& cpu,
 	const std::uint64_t handle)
 {
-	return state.sys_proc->handle_table().get_object<registry_key_host>(handle);
+	return state.get_handle_object<registry_key_host>(cpu, handle);
 }
 
-std::uint64_t open_key_handle(win_kernel_state& state, std::shared_ptr<win_registry_key> key,
-	std::string path, const std::uint32_t access)
+std::uint64_t open_key_handle(win_kernel_state& state, vcpu& cpu, std::shared_ptr<win_registry_key> key,
+	std::string path, const std::uint32_t access, const std::uint32_t attributes)
 {
 	auto host = std::make_shared<registry_key_host>();
 	host->key = std::move(key);
@@ -370,10 +370,10 @@ std::uint64_t open_key_handle(win_kernel_state& state, std::shared_ptr<win_regis
 		host, prot_rw | prot_supervisor);
 	host->body = addr;
 
-	return addr ? state.sys_proc->handle_table().create_handle(addr, access) : 0;
+	return addr ? state.create_handle(cpu, addr, access, attributes) : 0;
 }
 
-std::string resolve_key_path(win_kernel_state& state, addr_space& space,
+std::string resolve_key_path(win_kernel_state& state, vcpu& cpu, addr_space& space,
 	const emu_object<_OBJECT_ATTRIBUTES>& object_attributes)
 {
 	if (!object_attributes)
@@ -389,7 +389,7 @@ std::string resolve_key_path(win_kernel_state& state, addr_space& space,
 	if (!root)
 		return relative;
 
-	const auto parent = key_from_handle(state, root);
+	const auto parent = key_from_handle(state, cpu, root);
 
 	if (!parent)
 	{
@@ -437,7 +437,7 @@ void modules::register_ntoskrnl_reg_ops(win_kernel_state& state, proc_module& mo
 		emu_object<std::uint32_t> disposition) -> NTSTATUS
 	{
 		auto& space = *cpu.curr_addr_space();
-		const auto path = resolve_key_path(*st, space, object_attributes);
+		const auto path = resolve_key_path(*st, cpu, space, object_attributes);
 
 		if (!key_handle || path.empty())
 			return STATUS_INVALID_PARAMETER;
@@ -451,15 +451,23 @@ void modules::register_ntoskrnl_reg_ops(win_kernel_state& state, proc_module& mo
 			return STATUS_UNSUCCESSFUL;
 		}
 
-		const auto handle = open_key_handle(*st, std::move(key), path, desired_access);
+		const auto handle = open_key_handle(*st, cpu, std::move(key), path, desired_access,
+			object_attributes ? object_attributes.field(&_OBJECT_ATTRIBUTES::Attributes).read() : 0);
 
 		if (!handle)
 			return STATUS_INSUFFICIENT_RESOURCES;
 
-		key_handle.write(handle);
-
-		if (disposition)
-			disposition.write(existed ? reg_opened_existing_key : reg_created_new_key);
+		try
+		{
+			if (disposition)
+				disposition.write(existed ? reg_opened_existing_key : reg_created_new_key);
+			key_handle.write(handle);
+		}
+		catch (...)
+		{
+			st->close_handle(cpu, handle, 0);
+			return STATUS_ACCESS_VIOLATION;
+		}
 
 		THREAD_LOG_INFO("ZwCreateKey('{}', access=0x{:X}) -> handle=0x{:X} ({})",
 			path, desired_access, handle, existed ? "existing" : "new");
@@ -472,7 +480,7 @@ void modules::register_ntoskrnl_reg_ops(win_kernel_state& state, proc_module& mo
 		emu_object<_OBJECT_ATTRIBUTES> object_attributes) -> NTSTATUS
 	{
 		auto& space = *cpu.curr_addr_space();
-		const auto path = resolve_key_path(*st, space, object_attributes);
+		const auto path = resolve_key_path(*st, cpu, space, object_attributes);
 
 		if (!key_handle)
 			return STATUS_INVALID_PARAMETER;
@@ -485,12 +493,18 @@ void modules::register_ntoskrnl_reg_ops(win_kernel_state& state, proc_module& mo
 			return STATUS_OBJECT_NAME_NOT_FOUND;
 		}
 
-		const auto handle = open_key_handle(*st, std::move(key), path, desired_access);
+		const auto handle = open_key_handle(*st, cpu, std::move(key), path, desired_access,
+			object_attributes ? object_attributes.field(&_OBJECT_ATTRIBUTES::Attributes).read() : 0);
 
 		if (!handle)
 			return STATUS_INSUFFICIENT_RESOURCES;
 
-		key_handle.write(handle);
+		try { key_handle.write(handle); }
+		catch (...)
+		{
+			st->close_handle(cpu, handle, 0);
+			return STATUS_ACCESS_VIOLATION;
+		}
 
 		THREAD_LOG_INFO("ZwOpenKey('{}', access=0x{:X}) -> handle=0x{:X}",
 			path, desired_access, handle);
@@ -502,7 +516,7 @@ void modules::register_ntoskrnl_reg_ops(win_kernel_state& state, proc_module& mo
 		const std::uint32_t key_information_class, const addr_t key_information,
 		const std::uint32_t length, emu_object<std::uint32_t> result_length) -> NTSTATUS
 	{
-		const auto host = key_from_handle(*st, key_handle);
+		const auto host = key_from_handle(*st, cpu, key_handle);
 
 		if (!host)
 		{
@@ -571,7 +585,7 @@ void modules::register_ntoskrnl_reg_ops(win_kernel_state& state, proc_module& mo
 		const addr_t key_information, const std::uint32_t length,
 		emu_object<std::uint32_t> result_length) -> NTSTATUS
 	{
-		const auto host = key_from_handle(*st, key_handle);
+		const auto host = key_from_handle(*st, cpu, key_handle);
 
 		if (!host)
 			return STATUS_INVALID_HANDLE;
@@ -608,7 +622,7 @@ void modules::register_ntoskrnl_reg_ops(win_kernel_state& state, proc_module& mo
 		const std::uint32_t key_value_information_class, const addr_t key_value_information,
 		const std::uint32_t length, emu_object<std::uint32_t> result_length) -> NTSTATUS
 	{
-		const auto host = key_from_handle(*st, key_handle);
+		const auto host = key_from_handle(*st, cpu, key_handle);
 		if (!host) return STATUS_INVALID_HANDLE;
 		auto& space = *cpu.curr_addr_space();
 		std::u16string name;
@@ -638,7 +652,7 @@ void modules::register_ntoskrnl_reg_ops(win_kernel_state& state, proc_module& mo
 		const addr_t key_value_information, const std::uint32_t length,
 		emu_object<std::uint32_t> result_length) -> NTSTATUS
 	{
-		const auto host = key_from_handle(*st, key_handle);
+		const auto host = key_from_handle(*st, cpu, key_handle);
 
 		if (!host)
 			return STATUS_INVALID_HANDLE;
@@ -677,7 +691,7 @@ void modules::register_ntoskrnl_reg_ops(win_kernel_state& state, proc_module& mo
 		emu_object<_UNICODE_STRING> value_name, const std::uint32_t title_index,
 		const std::uint32_t type, const addr_t data, const std::uint32_t data_size) -> NTSTATUS
 	{
-		const auto host = key_from_handle(*st, key_handle);
+		const auto host = key_from_handle(*st, cpu, key_handle);
 		if (!host) return STATUS_INVALID_HANDLE;
 		auto& space = *cpu.curr_addr_space();
 		std::u16string name;
@@ -698,7 +712,7 @@ void modules::register_ntoskrnl_reg_ops(win_kernel_state& state, proc_module& mo
 	auto delete_value_key = [st](vcpu& cpu, const std::uint64_t key_handle,
 		emu_object<_UNICODE_STRING> value_name) -> NTSTATUS
 	{
-		const auto host = key_from_handle(*st, key_handle);
+		const auto host = key_from_handle(*st, cpu, key_handle);
 		if (!host) return STATUS_INVALID_HANDLE;
 		std::u16string name;
 		const auto captured = capture_value_name(*cpu.curr_addr_space(), value_name, name);
@@ -710,9 +724,9 @@ void modules::register_ntoskrnl_reg_ops(win_kernel_state& state, proc_module& mo
 		});
 	};
 
-	auto delete_key = [st](vcpu&, const std::uint64_t key_handle) -> NTSTATUS
+	auto delete_key = [st](vcpu& cpu, const std::uint64_t key_handle) -> NTSTATUS
 	{
-		const auto host = key_from_handle(*st, key_handle);
+		const auto host = key_from_handle(*st, cpu, key_handle);
 
 		if (!host)
 			return STATUS_INVALID_HANDLE;
@@ -725,9 +739,9 @@ void modules::register_ntoskrnl_reg_ops(win_kernel_state& state, proc_module& mo
 	};
 
 	// Nothing is behind the store but memory, so there is no write to push out.
-	auto flush_key = [st](vcpu&, const std::uint64_t key_handle) -> NTSTATUS
+	auto flush_key = [st](vcpu& cpu, const std::uint64_t key_handle) -> NTSTATUS
 	{
-		const auto host = key_from_handle(*st, key_handle);
+		const auto host = key_from_handle(*st, cpu, key_handle);
 
 		if (!host)
 			return STATUS_INVALID_HANDLE;
@@ -748,7 +762,7 @@ void modules::register_ntoskrnl_reg_ops(win_kernel_state& state, proc_module& mo
 	state.redirect_ntzw(mod, "SetValueKey", set_value_key);
 	state.redirect_ntzw(mod, "DeleteValueKey", delete_value_key);
 	state.redirect_ntzw(mod, "DeleteKey", delete_key);
-	state.redirect(mod, "ZwFlushKey", flush_key);
+	state.redirect_ntzw(mod, "FlushKey", flush_key);
 
 	state.redirect(mod, "RtlWriteRegistryValue",
 		[st](vcpu& cpu, const std::uint32_t relative_to, const addr_t path,
@@ -919,12 +933,12 @@ void modules::register_ntoskrnl_reg_ops(win_kernel_state& state, proc_module& mo
 
 	// Nothing here notices a registry write, so the watch is accepted and the event stays unset.
 	state.redirect_ntzw(mod, "NotifyChangeKey",
-		[st](vcpu&, const std::uint64_t key_handle, const addr_t event, const addr_t apc_routine,
+		[st](vcpu& cpu, const std::uint64_t key_handle, const addr_t event, const addr_t apc_routine,
 			const addr_t apc_context, emu_object<_IO_STATUS_BLOCK> io_status_block,
 			const std::uint32_t completion_filter, const bool watch_tree, const addr_t buffer,
 			const std::uint32_t buffer_size, const bool asynchronous) -> NTSTATUS
 		{
-			if (!st->sys_proc->handle_table().lookup_handle(key_handle))
+			if (!st->lookup_handle(cpu, key_handle))
 			{
 				THREAD_LOG_WARN("NtNotifyChangeKey: handle 0x{:X} is not open", key_handle);
 				return STATUS_INVALID_HANDLE;

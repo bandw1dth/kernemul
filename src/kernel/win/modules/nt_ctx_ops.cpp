@@ -29,7 +29,7 @@ target_thread resolve_thread(win_kernel_state& state, vcpu& cpu, const std::uint
 	if (handle == current_thread_handle)
 		return { self, true };
 
-	const auto entry = state.sys_proc->handle_table().lookup_handle(handle);
+	const auto entry = state.lookup_handle(cpu, handle);
 
 	if (!entry)
 		return {};

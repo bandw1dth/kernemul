@@ -533,7 +533,7 @@ void modules::register_ntoskrnl_mem_ops(win_kernel_state& state, proc_module& mo
 
 			if (file_handle)
 			{
-				const auto file = st->sys_proc->handle_table().get_object<file_host>(file_handle);
+				const auto file = st->get_handle_object<file_host>(cpu, file_handle);
 
 				if (!file)
 				{

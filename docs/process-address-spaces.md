@@ -75,8 +75,8 @@ It does not add general propagation of newly allocated kernel root-table slots.
 Cross-process copy rejects copy-on-write destinations instead of materializing
 private pages, and rejects guarded pages without consuming the guard. Ordered
 VM metadata locks stabilize permission checks during transfer, but do not make
-the copied contents an atomic snapshot. Process handles still use the existing
-global handle table. Multi-vCPU behavior and ARM64 execution are not validated
+the copied contents an atomic snapshot. Process handles now use
+[process-local tables](process-handle-tables.md). Multi-vCPU behavior and ARM64 execution are not validated
 by the x64 Hyper-V fixtures.
 
 The Hyper-V instruction-hook implementation can expose its internal TF bit to

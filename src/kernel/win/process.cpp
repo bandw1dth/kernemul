@@ -216,7 +216,9 @@ void win_kernel_state::call_lifecycle(vcpu& cpu, addr_t routine,
 NTSTATUS win_kernel_state::create_ob_handle(vcpu& cpu, addr_t object, std::uint32_t access,
     std::uint32_t attributes, emu_object<std::uint64_t> output,
     std::uint32_t operation, std::uint32_t access_ceiling,
-    const std::function<bool(std::uint64_t)>& write_output)
+    const std::function<bool(std::uint64_t)>& write_output,
+    windows_process* source_process, windows_process* target_process,
+    std::optional<std::uint8_t> mode)
 {
     if (ob_notify.in_callback(cpu.id())) fail_ob_notify(cpu, "nested handle operations are unsupported");
     if (!output) return STATUS_INVALID_PARAMETER;
@@ -227,15 +229,22 @@ NTSTATUS win_kernel_state::create_ob_handle(vcpu& cpu, addr_t object, std::uint3
         if (!space.mmu_->virt_to_phys(space, output.address() + i)) return STATUS_ACCESS_VIOLATION;
     const auto type = ob_object_type(object);
     if (type && (access & 0xf2000000u)) return STATUS_NOT_SUPPORTED; // generic / MAXIMUM_ALLOWED
-    if (type && (access & ~access_ceiling)) return STATUS_ACCESS_DENIED;
+    if ((type || operation == 2) && (access & ~access_ceiling)) return STATUS_ACCESS_DENIED;
     const auto original = access;
     const auto modifiable = type == ob_process_type ? win::ob_process_modifiable : win::ob_thread_modifiable;
-    auto& handles = sys_proc->handle_table();
+    const auto effective = current_process(cpu);
+    if ((attributes & 0x200u)
+        && (win::executing_user_mode(cpu) || mode.value_or(handle_mode(cpu)) != 0))
+        return STATUS_INVALID_PARAMETER;
+    auto* destination = (attributes & 0x200u) ? sys_proc.get() : target_process ? target_process : effective.get();
+    if (!destination) return STATUS_INVALID_PARAMETER;
+    auto& handles = destination->handle_table();
     std::uint64_t handle = 0;
     auto body = [&]() -> NTSTATUS {
         try
         {
             handle = handles.create_handle(object, access, attributes);
+            if (handle && (attributes & 0x200u)) handle |= 0xffffffff80000000ull;
             if (!handle) return STATUS_INSUFFICIENT_RESOURCES;
             // A caller with checked user output publishes under its VM metadata
             // lock here, after pre callbacks and without holding it across guest code.
@@ -243,7 +252,7 @@ NTSTATUS win_kernel_state::create_ob_handle(vcpu& cpu, addr_t object, std::uint3
             {
                 if (!write_output(handle))
                 {
-                    handles.close_handle(handle);
+                    handles.close_handle(local_handle_value(handle));
                     handle = 0;
                     return STATUS_ACCESS_VIOLATION;
                 }
@@ -251,7 +260,7 @@ NTSTATUS win_kernel_state::create_ob_handle(vcpu& cpu, addr_t object, std::uint3
             else output.write(handle);
             return STATUS_SUCCESS;
         }
-        catch (...) { if (handle) handles.close_handle(handle); handle = 0; return STATUS_ACCESS_VIOLATION; }
+        catch (...) { if (handle) handles.close_handle(local_handle_value(handle)); handle = 0; return STATUS_ACCESS_VIOLATION; }
     };
     if (!type) return body();
     // Count an object reference across pre/body/post. Object manager deliberately
@@ -262,9 +271,10 @@ NTSTATUS win_kernel_state::create_ob_handle(vcpu& cpu, addr_t object, std::uint3
         pin(win_obj_manager& o, addr_t a) : objs(o), object(a) { objs.reference_object(object); }
         ~pin() { objs.dereference_object(object); }
     } reference(objs, object);
-    const auto caller = cpu.thread() ? std::dynamic_pointer_cast<windows_process>(cpu.thread()->proc()) : nullptr;
-    const auto process = caller ? caller->eprocess().address() : 0;
-    if (operation == 2 && !process) return STATUS_NOT_SUPPORTED;
+    const auto source = source_process ? source_process : effective.get();
+    const auto source_address = source ? source->eprocess().address() : 0;
+    const auto target_address = target_process ? target_process->eprocess().address() : destination->eprocess().address();
+    if (operation == 2 && (!source_address || !target_address)) return STATUS_NOT_SUPPORTED;
     struct frame { std::unique_ptr<pool_block> scratch; addr_t context = 0; };
     std::vector<frame> frames;
     try
@@ -276,7 +286,7 @@ NTSTATUS win_kernel_state::create_ob_handle(vcpu& cpu, addr_t object, std::uint3
                 frames.push_back({std::move(scratch)});
                 const auto info = frames[index].scratch->addr(), params = info + 48;
                 const ob_pre_info expected{operation, (attributes & 0x200u) ? 1u : 0u, object, type, 0, params};
-                const ob_parameters expected_params{access, original, operation == 2 ? process : 0, operation == 2 ? process : 0};
+                const ob_parameters expected_params{access, original, operation == 2 ? source_address : 0, operation == 2 ? target_address : 0};
                 space.write_mem(info, expected);
                 space.write_mem(params, expected_params);
                 if (op.pre_operation) call_ob_notify(cpu, op.pre_operation, reg->value.context, info, true, [&] {
@@ -305,7 +315,7 @@ NTSTATUS win_kernel_state::create_ob_handle(vcpu& cpu, addr_t object, std::uint3
                 });
             });
     }
-    catch (...) { if (handle) handles.close_handle(handle); throw; }
+    catch (...) { if (handle) handles.close_handle(local_handle_value(handle)); throw; }
 }
 
 NTSTATUS win_kernel_state::call_registry_notify(vcpu& cpu,
@@ -508,6 +518,10 @@ void win_kernel_state::unpublish_process(windows_process& target)
 {
 	{
 		std::unique_lock lock(proc_mtx_);
+		const auto address = target.handle_table().guest_address();
+		if (address)
+			if (auto owner = std::dynamic_pointer_cast<windows_process>(target.weak_from_this().lock()))
+				retained_handle_tables_[address] = std::move(owner);
 		processes.erase(target.id());
 	}
 	if (target.eprocess() && active_process_list.address())
@@ -515,8 +529,10 @@ void win_kernel_state::unpublish_process(windows_process& target)
 		std::scoped_lock lock(list_mtx_);
 		active_process_list.remove(target.eprocess().address());
 	}
-	if (const auto handle = std::exchange(target.owned_console, 0))
-		sys_proc->handle_table().close_handle(handle);
+	if (target.eprocess())
+		target.eprocess().field(&_EPROCESS::ObjectTable).write(nullptr);
+	target.handle_table().rundown();
+	target.owned_console = 0;
 	LOG_INFO("process lifecycle unpublish: pid={} state={}", target.id(),
 		target.lifecycle == process_lifecycle::rejected ? "rejected" : target.lifecycle == process_lifecycle::exiting ? "exiting" : "setup-failed");
 }
@@ -1098,4 +1114,106 @@ std::shared_ptr<windows_process> win_kernel_state::find_process_by_object(const 
 		return proc;
 	}
 	return {};
+}
+
+void windows_process::set_eprocess(emu_object<_EPROCESS> ep)
+{
+    // Preserve the identity for setup-failure unpublication if allocation throws.
+    eprocess_ = std::move(ep);
+    if (!eprocess_) return;
+    handle_table_.initialize_guest(*eprocess_.space(), eprocess_.address(), id());
+    eprocess_.field(&_EPROCESS::ObjectTable).write(
+        reinterpret_cast<_HANDLE_TABLE*>(handle_table_.guest_address()));
+}
+
+std::uint8_t win_kernel_state::handle_mode(vcpu& cpu)
+{
+    if (win::executing_user_mode(cpu)) return 1;
+    const auto t = std::dynamic_pointer_cast<win_thread>(cpu.thread());
+    return t && t->ethread() ? static_cast<std::uint8_t>(
+        t->ethread().field(&_ETHREAD::Tcb).field(&_KTHREAD::PreviousMode).read()) : 0;
+}
+
+std::uint64_t win_kernel_state::local_handle_value(std::uint64_t handle)
+{
+    return handle & 0x7fffffffull;
+}
+
+win_handle_table* win_kernel_state::select_handle_table(vcpu& cpu, std::uint64_t handle,
+    std::optional<std::uint8_t> mode)
+{
+    const bool kernel = (handle & 0xffffffff80000000ull) == 0xffffffff80000000ull;
+    const auto local = local_handle_value(handle);
+    if ((!kernel && handle != local) || !local || (local & 3) || local > 131071ull * 4
+        || !(local & 0x3ff)) return nullptr;
+    if (kernel)
+        return !win::executing_user_mode(cpu) && mode.value_or(handle_mode(cpu)) == 0
+            ? &sys_proc->handle_table() : nullptr;
+    const auto proc = current_process(cpu);
+    return proc ? &proc->handle_table() : nullptr;
+}
+
+std::optional<win_handle_table::handle_entry> win_kernel_state::lookup_handle(vcpu& cpu,
+    std::uint64_t handle, std::optional<std::uint8_t> mode)
+{
+    const auto table = select_handle_table(cpu, handle, mode);
+    return table ? table->lookup_handle(local_handle_value(handle)) : std::nullopt;
+}
+
+std::uint64_t win_kernel_state::create_handle(vcpu& cpu, addr_t object, std::uint32_t access,
+    std::uint32_t attributes, windows_process* target)
+{
+    const bool kernel = (attributes & 0x200u) != 0;
+    if (kernel && handle_mode(cpu) != 0) return 0;
+    const auto current = current_process(cpu);
+    auto* destination = kernel ? sys_proc.get() : target ? target : current.get();
+    if (!destination) return 0;
+    const auto handle = destination->handle_table().create_handle(object, access, attributes);
+    return handle && kernel ? 0xffffffff80000000ull | handle : handle;
+}
+
+bool win_kernel_state::close_handle(vcpu& cpu, std::uint64_t handle,
+    std::optional<std::uint8_t> mode)
+{
+    const auto table = select_handle_table(cpu, handle, mode);
+    return table && table->close_handle(local_handle_value(handle));
+}
+
+win_handle_table* win_kernel_state::find_handle_table(addr_t address)
+{
+    if (!address) return nullptr;
+    std::unique_lock lock(proc_mtx_);
+    if (const auto it = retained_handle_tables_.find(address); it != retained_handle_tables_.end())
+        return &it->second->handle_table();
+    for (const auto& [id, process] : processes)
+    {
+        const auto owner = std::dynamic_pointer_cast<windows_process>(process);
+        if (owner && owner->handle_table().guest_address() == address)
+        {
+            retained_handle_tables_.emplace(address, owner);
+            return &owner->handle_table();
+        }
+    }
+    if (sys_proc->handle_table().guest_address() == address) return &sys_proc->handle_table();
+    return nullptr;
+}
+
+win_handle_table* win_kernel_state::find_process_handle_table(addr_t eprocess)
+{
+    if (!eprocess) return nullptr;
+    std::unique_lock lock(proc_mtx_);
+    for (const auto& [address, owner] : retained_handle_tables_)
+        if (owner->eprocess().address() == eprocess) return &owner->handle_table();
+    for (const auto& [id, process] : processes)
+    {
+        const auto owner = std::dynamic_pointer_cast<windows_process>(process);
+        if (owner && owner->eprocess().address() == eprocess)
+        {
+            const auto address = owner->handle_table().guest_address();
+            if (!address) return nullptr;
+            retained_handle_tables_.emplace(address, owner);
+            return &owner->handle_table();
+        }
+    }
+    return sys_proc->eprocess().address() == eprocess ? &sys_proc->handle_table() : nullptr;
 }

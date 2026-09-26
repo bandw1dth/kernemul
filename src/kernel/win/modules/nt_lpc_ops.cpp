@@ -32,6 +32,7 @@ constexpr std::uint64_t maximum_port_view_size = 0x100000;
 struct alpc_port_host final : win_object
 {
 	std::string name;
+	addr_t body = 0;
 	bool is_server = false;
 	std::weak_ptr<alpc_port_host> peer;
 
@@ -102,6 +103,7 @@ void clear_connection_information(vcpu& cpu, const addr_t information,
 	cpu.curr_addr_space()->write_mem(information, zeros.data(), zeros.size());
 }
 
+// These names do not resolve RootDirectory-relative object paths.
 std::string attribute_name(vcpu& cpu, const emu_object<_OBJECT_ATTRIBUTES>& object_attributes)
 {
 	auto& space = *cpu.curr_addr_space();
@@ -120,13 +122,13 @@ void modules::register_ntoskrnl_lpc_ops(win_kernel_state& state, proc_module& mo
 {
 	auto* st = &state;
 
-	auto port_from_handle = [st](const std::uint64_t handle)
+	auto port_from_handle = [st](vcpu& cpu, const std::uint64_t handle)
 	{
-		return st->sys_proc->handle_table().get_object<alpc_port_host>(handle);
+		return st->get_handle_object<alpc_port_host>(cpu, handle);
 	};
 
-	auto create_port_object = [st](std::shared_ptr<alpc_port_host> host,
-		const std::uint32_t desired_access) -> std::uint64_t
+	auto create_port_object = [st](vcpu& cpu, std::shared_ptr<alpc_port_host> host,
+		const std::uint32_t desired_access, const std::uint32_t attributes) -> std::uint64_t
 	{
 		const std::array<std::uint8_t, alpc_port_body_size> body{};
 		const auto addr = st->objs.create_object(0, body.data(), body.size(), host,
@@ -135,10 +137,9 @@ void modules::register_ntoskrnl_lpc_ops(win_kernel_state& state, proc_module& mo
 		if (!addr)
 			return 0;
 
-		if (!host->name.empty())
-			st->objs.register_named_object(host->name, addr);
+		host->body = addr;
 
-		return st->sys_proc->handle_table().create_handle(addr, desired_access);
+		return st->create_handle(cpu, addr, desired_access, attributes);
 	};
 
 	state.redirect_ntzw(mod, "AlpcCreatePort",
@@ -159,12 +160,30 @@ void modules::register_ntoskrnl_lpc_ops(win_kernel_state& state, proc_module& mo
 				return STATUS_OBJECT_NAME_COLLISION;
 			}
 
-			const auto handle = create_port_object(host, PORT_ALL_ACCESS);
+			const auto handle = create_port_object(cpu, host, PORT_ALL_ACCESS,
+				object_attributes ? object_attributes.field(&_OBJECT_ATTRIBUTES::Attributes).read() : 0);
 
 			if (!handle)
 				return STATUS_INSUFFICIENT_RESOURCES;
 
-			port_handle.write(handle);
+			if (!host->name.empty())
+			{
+				// Another create may have published this name while our handle was being made.
+				if (!st->objs.try_register_named_object(host->name, host->body))
+				{
+					st->close_handle(cpu, handle, 0);
+					return STATUS_OBJECT_NAME_COLLISION;
+				}
+			}
+
+			try { port_handle.write(handle); }
+			catch (...)
+			{
+				if (!host->name.empty())
+					st->objs.unregister_named_object(host->name, host->body);
+				st->close_handle(cpu, handle, 0);
+				return STATUS_ACCESS_VIOLATION;
+			}
 
 			THREAD_LOG_INFO("NtAlpcCreatePort('{}', attributes=0x{:X}) -> handle=0x{:X}",
 				host->name, port_attributes.address(), handle);
@@ -175,7 +194,7 @@ void modules::register_ntoskrnl_lpc_ops(win_kernel_state& state, proc_module& mo
 	state.redirect_ntzw(mod, "AlpcConnectPort",
 		[st, create_port_object](vcpu& cpu, emu_object<std::uint64_t> port_handle,
 			emu_object<_UNICODE_STRING> port_name,
-			[[maybe_unused]] emu_object<_OBJECT_ATTRIBUTES> object_attributes,
+			emu_object<_OBJECT_ATTRIBUTES> object_attributes,
 			[[maybe_unused]] emu_object<_ALPC_PORT_ATTRIBUTES> port_attributes,
 			const std::uint32_t flags, [[maybe_unused]] const addr_t required_server_sid,
 			emu_object<_PORT_MESSAGE> connection_message, emu_object<std::uint64_t> buffer_length,
@@ -201,28 +220,39 @@ void modules::register_ntoskrnl_lpc_ops(win_kernel_state& state, proc_module& mo
 			client->name = name;
 			client->peer = server;
 
-			const auto handle = create_port_object(client, PORT_ALL_ACCESS);
+			const auto handle = create_port_object(cpu, client, PORT_ALL_ACCESS,
+				object_attributes ? object_attributes.field(&_OBJECT_ATTRIBUTES::Attributes).read() : 0);
 
 			if (!handle)
 				return STATUS_INSUFFICIENT_RESOURCES;
 
-			server->peer = client;
-
-			port_handle.write(handle);
-
-			if (connection_message)
+			const auto previous_peer = server->peer;
+			try
 			{
-				auto message = read_message(cpu, connection_message);
-				const auto size = message.size();
+				server->peer = client;
 
-				server->post(std::move(message));
+				port_handle.write(handle);
 
-				THREAD_LOG_INFO("NtAlpcConnectPort('{}'): connection message of {} bytes queued "
-					"to the server", name, size);
+				if (connection_message)
+				{
+					auto message = read_message(cpu, connection_message);
+					const auto size = message.size();
+
+					server->post(std::move(message));
+
+					THREAD_LOG_INFO("NtAlpcConnectPort('{}'): connection message of {} bytes queued "
+						"to the server", name, size);
+				}
+
+				if (buffer_length)
+					buffer_length.write(0);
 			}
-
-			if (buffer_length)
-				buffer_length.write(0);
+			catch (...)
+			{
+				server->peer = previous_peer;
+				st->close_handle(cpu, handle, 0);
+				return STATUS_ACCESS_VIOLATION;
+			}
 
 			THREAD_LOG_INFO("NtAlpcConnectPort('{}', flags=0x{:X}) -> handle=0x{:X}",
 				name, flags, handle);
@@ -238,7 +268,7 @@ void modules::register_ntoskrnl_lpc_ops(win_kernel_state& state, proc_module& mo
 			[[maybe_unused]] const addr_t receive_message_attributes,
 			emu_object<std::int64_t> timeout) -> NTSTATUS
 		{
-			const auto port = port_from_handle(port_handle);
+			const auto port = port_from_handle(cpu, port_handle);
 
 			if (!port)
 			{
@@ -310,43 +340,51 @@ void modules::register_ntoskrnl_lpc_ops(win_kernel_state& state, proc_module& mo
 		auto client = std::make_shared<alpc_port_host>();
 		client->name = name;
 
-		const auto handle = create_port_object(client, PORT_ALL_ACCESS);
+		const auto handle = create_port_object(cpu, client, PORT_ALL_ACCESS, 0);
 
 		if (!handle)
 			return STATUS_INSUFFICIENT_RESOURCES;
 
-		port_handle.write(handle);
-
-		auto& space = *cpu.curr_addr_space();
-
-		// PORT_VIEW is not in the generated types: the bases sit past the handle and offset.
-		if (client_view)
+		try
 		{
-			const auto view_size = space.read_mem<std::uint64_t>(client_view + 0x18);
+			port_handle.write(handle);
 
-			if (view_size && view_size <= maximum_port_view_size)
+			auto& space = *cpu.curr_addr_space();
+
+			// PORT_VIEW is not in the generated types: the bases sit past the handle and offset.
+			if (client_view)
 			{
-				const auto base = space.alloc(static_cast<std::size_t>(view_size), prot_rw);
+				const auto view_size = space.read_mem<std::uint64_t>(client_view + 0x18);
 
-				space.write_mem<std::uint64_t>(client_view + 0x20, base);
-				space.write_mem<std::uint64_t>(client_view + 0x28, base);
+				if (view_size && view_size <= maximum_port_view_size)
+				{
+					const auto base = space.alloc(static_cast<std::size_t>(view_size), prot_rw);
 
-				THREAD_LOG_INFO("{}: client view of 0x{:X} bytes at 0x{:X}",
-					who, view_size, base);
+					space.write_mem<std::uint64_t>(client_view + 0x20, base);
+					space.write_mem<std::uint64_t>(client_view + 0x28, base);
+
+					THREAD_LOG_INFO("{}: client view of 0x{:X} bytes at 0x{:X}",
+						who, view_size, base);
+				}
 			}
-		}
 
-		// No server maps a view, but a zero size reads as a broken connection.
-		if (server_view)
+			// No server maps a view, but a zero size reads as a broken connection.
+			if (server_view)
+			{
+				auto value = server_view.read();
+				value.ViewSize = maximum_port_view_size;
+				value.ViewBase = nullptr;
+				server_view.write(value);
+			}
+
+			if (maximum_message_length)
+				maximum_message_length.write(default_maximum_message_length);
+		}
+		catch (...)
 		{
-			auto value = server_view.read();
-			value.ViewSize = maximum_port_view_size;
-			value.ViewBase = nullptr;
-			server_view.write(value);
+			st->close_handle(cpu, handle, 0);
+			return STATUS_ACCESS_VIOLATION;
 		}
-
-		if (maximum_message_length)
-			maximum_message_length.write(default_maximum_message_length);
 
 		THREAD_LOG_WARN("{}('{}') -> handle=0x{:X}: nothing here runs an LPC server, so nothing "
 			"will answer a message sent to it", who, name, handle);

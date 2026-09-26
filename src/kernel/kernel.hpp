@@ -237,14 +237,26 @@ struct kernel_state
 					{
 						THREAD_LOG_ERR("{}!{} faulted: {}", m->name,
 							name_at(*m, addr), e.what());
-						if (cpu.in_dpc) { cpu.dpc_failed = true; cpu.stop(); }
-						if (cpu.checked_calls.fail()) cpu.stop();
+						const bool checked_failed = cpu.checked_calls.fail();
+						if (cpu.in_dpc) cpu.dpc_failed = true;
+						// An unchecked fault must also prevent the thread from being rescheduled.
+						if (!cpu.in_dpc && !checked_failed)
+							if (const auto t = cpu.thread())
+								if (const auto p = t->proc(); p && p->scheduler()) p->scheduler()->stop();
+						cpu.stop();
+						return;
 					}
 					catch (...)
 					{
 						THREAD_LOG_ERR("{}!{} faulted: unknown host exception", m->name, name_at(*m, addr));
-						if (cpu.in_dpc) { cpu.dpc_failed = true; cpu.stop(); }
-						if (cpu.checked_calls.fail()) cpu.stop();
+						const bool checked_failed = cpu.checked_calls.fail();
+						if (cpu.in_dpc) cpu.dpc_failed = true;
+						// An unchecked fault must also prevent the thread from being rescheduled.
+						if (!cpu.in_dpc && !checked_failed)
+							if (const auto t = cpu.thread())
+								if (const auto p = t->proc(); p && p->scheduler()) p->scheduler()->stop();
+						cpu.stop();
+						return;
 					}
 
 					// Stopping the cpu moves the pc on some architectures, so it is put back.

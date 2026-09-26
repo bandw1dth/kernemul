@@ -10,6 +10,7 @@
 #include "../../../util/log.hpp"
 #include <array>
 #include <exception>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <new>
@@ -86,23 +87,40 @@ struct ob_operation_registration_t
 
 void modules::register_ntoskrnl_object_ops(win_kernel_state& state, proc_module& mod)
 {
-	auto* sys_proc = state.sys_proc.get();
-
     state.redirect(mod, "ObReferenceObjectByHandle",
-        [st = &state, sys_proc](vcpu&, std::uint64_t handle, std::uint32_t desired_access,
+        [st = &state](vcpu& cpu, std::uint64_t handle, std::uint32_t desired_access,
             addr_t object_type, std::uint8_t access_mode, emu_object<addr_t> object_out,
             emu_object<void> handle_information) -> NTSTATUS
         {
-            const auto entry = sys_proc->handle_table().lookup_handle(handle);
-            if (!entry || (access_mode && (entry->attributes & 0x200u))) return STATUS_INVALID_HANDLE;
+            if (access_mode > 1) return STATUS_INVALID_PARAMETER;
+            auto entry = st->lookup_handle(cpu, handle, access_mode);
+            if (handle == ~std::uint64_t{0})
+            {
+                const auto process = st->current_process(cpu);
+                if (process) entry = win_handle_table::handle_entry{process->eprocess().address(), 0x001fffffu, 0};
+            }
+            else if (handle == ~std::uint64_t{1})
+            {
+                const auto thread = std::dynamic_pointer_cast<win_thread>(cpu.thread());
+                if (thread) entry = win_handle_table::handle_entry{thread->ethread().address(), 0x001fffffu, 0};
+            }
+            if (!entry) return STATUS_INVALID_HANDLE;
             const auto actual = st->ob_object_type(entry->body_addr);
             if (object_type && (actual || object_type == st->ob_process_type || object_type == st->ob_thread_type)
                 && object_type != actual) return STATUS_OBJECT_TYPE_MISMATCH;
-            if (access_mode && actual && (desired_access & ~entry->access)) return STATUS_ACCESS_DENIED;
-            if (access_mode && actual && (desired_access & 0xf2000000u)) return STATUS_NOT_SUPPORTED;
+            if (access_mode && (desired_access & ~entry->access)) return STATUS_ACCESS_DENIED;
+            if (access_mode && (desired_access & 0xf2000000u)) return STATUS_NOT_SUPPORTED;
             if (!object_out) return STATUS_INVALID_PARAMETER;
             try
             {
+                // Probe outputs before publishing either result.
+                object_out.write(object_out.read());
+                if (handle_information)
+                {
+                    struct information { std::uint32_t attributes, granted; };
+                    auto output = emu_object<information>(*handle_information.space(), handle_information.address());
+                    output.write(output.read());
+                }
                 if (handle_information)
                 {
                     struct information { std::uint32_t attributes, granted; };
@@ -154,54 +172,29 @@ void modules::register_ntoskrnl_object_ops(win_kernel_state& state, proc_module&
 	state.redirect(mod, "ObfDereferenceObject", deref);
 	state.redirect(mod, "ObfDereferenceObjectWithTag", deref);
 
-	auto close_fn = [st = &state, sys_proc](vcpu& cpu, std::uint64_t handle) -> NTSTATUS
+	auto close_fn = [st = &state](vcpu& cpu, std::uint64_t handle) -> NTSTATUS
 	{
-		THREAD_LOG_INFO("NtClose(handle=0x{:X})", handle);
-
-		// The last handle on a device is what tells its driver the open is over, so the two
-		// requests real cleanup sends go out before the handle stops naming anything.
-		if (const auto host = sys_proc->handle_table().get_object<file_host>(handle);
-			host && host->is_device())
+		const auto entry = st->lookup_handle(cpu, handle);
+		if (!entry) return STATUS_INVALID_HANDLE;
+		if (entry->attributes & 1u) return static_cast<NTSTATUS>(0xC0000235); // STATUS_HANDLE_NOT_CLOSABLE
+		const auto host = st->objs.get_object<file_host>(entry->body_addr);
+		if (host && host->is_device())
 		{
-			if (host->builtin)
+			std::scoped_lock lock(host->close_mutex);
+			if (!st->close_handle(cpu, handle)) return STATUS_INVALID_HANDLE;
+			const auto header = st->objs.header_of(entry->body_addr).read();
+			if (header.HandleCount == 0 && host->file_object)
 			{
-				std::scoped_lock lock(host->close_mutex);
-				const auto entry = sys_proc->handle_table().lookup_handle(handle);
-				if (!entry || !sys_proc->handle_table().close_handle(handle)) return STATUS_INVALID_HANDLE;
-				const auto header = st->kernel_space().read_mem<_OBJECT_HEADER>(entry->body_addr - sizeof(_OBJECT_HEADER));
-				if (header.HandleCount == 0 && host->file_object)
-				{
-					if (auto* emulator = st->emulator())
-						for (const auto major : {irp_mj_cleanup, irp_mj_close})
-							emulator->dispatch_irp(cpu, {.major = major, .device_object = host->device_object,
-								.file_object = host->file_object});
-					st->pool.free(host->file_object);
-					host->file_object = 0;
-				}
-				return STATUS_SUCCESS;
+				if (auto* emulator = st->emulator())
+					for (const auto major : {irp_mj_cleanup, irp_mj_close})
+						emulator->dispatch_irp(cpu, {.major = major, .device_object = host->device_object,
+							.file_object = host->file_object});
+				st->pool.free(host->file_object);
+				host->file_object = 0;
 			}
-			if (auto* const emulator = st->emulator())
-			{
-				for (const auto major : { irp_mj_cleanup, irp_mj_close })
-				{
-					emulator->dispatch_irp(cpu, {
-						.major = major,
-						.device_object = host->device_object,
-						.file_object = host->file_object,
-					});
-				}
-			}
-
-			st->pool.free(host->file_object);
+			return STATUS_SUCCESS;
 		}
-
-		if (!sys_proc->handle_table().close_handle(handle))
-		{
-			THREAD_LOG_WARN("NtClose: invalid handle 0x{:X}", handle);
-			return STATUS_INVALID_HANDLE;
-		}
-
-		return STATUS_SUCCESS;
+		return st->close_handle(cpu, handle) ? STATUS_SUCCESS : STATUS_INVALID_HANDLE;
 	};
 
 	state.redirect_ntzw(mod, "Close", close_fn);
@@ -301,41 +294,122 @@ void modules::register_ntoskrnl_object_ops(win_kernel_state& state, proc_module&
             std::uint8_t access_mode, emu_object<std::uint64_t> handle) -> NTSTATUS
         {
             if (st->ob_notify.in_callback(cpu.id())) st->fail_ob_notify(cpu, "nested handle operations are unsupported");
+            if (access_mode > 1) return STATUS_INVALID_PARAMETER;
             const auto actual = st->ob_object_type(object);
             if (object_type && (actual || object_type == st->ob_process_type || object_type == st->ob_thread_type)
                 && object_type != actual) return STATUS_OBJECT_TYPE_MISMATCH;
             if (actual && passed_access_state) return STATUS_NOT_SUPPORTED;
-            if (actual && access_mode && (attributes & 0x200u)) return STATUS_INVALID_PARAMETER;
-            return st->create_ob_handle(cpu, object, access, attributes, handle);
+            if (access_mode && (attributes & 0x200u)) return STATUS_INVALID_PARAMETER;
+            return st->create_ob_handle(cpu, object, access, attributes, handle,
+                1, 0xffffffff, {}, nullptr, nullptr, access_mode);
         });
 
-	// There is one handle table, hanging off the system process, and every process here shares it.
 	state.redirect(mod, "ObReferenceProcessHandleTable",
-		[](vcpu&, emu_object<_EPROCESS> process) -> addr_t
+		[st = &state](vcpu&, emu_object<_EPROCESS> process) -> addr_t
 		{
-			const auto table = process
-				? guest_va(process.field(&_EPROCESS::ObjectTable).read()) : 0;
-
-			THREAD_LOG_INFO("ObReferenceProcessHandleTable(0x{:X}) -> 0x{:X}",
-				process.address(), table);
-
-			return table;
+			const auto table = st->find_process_handle_table(process.address());
+			if (!table || !table->reference()) return 0;
+			return table->guest_address();
+		});
+	if (mod.find_symbol("ObDereferenceProcessHandleTable"))
+		state.redirect(mod, "ObDereferenceProcessHandleTable",
+		[st = &state](vcpu&, emu_object<_EPROCESS> process)
+		{
+			if (const auto table = st->find_process_handle_table(process.address()))
+				table->dereference();
 		});
 
-	// Nothing here calls back into the guest, so null says the walk finished without a match.
+	// Windows 10.0.26100: callback(table, entry, handle, context), with entry locked.
 	state.redirect(mod, "ExEnumHandleTable",
-		[](vcpu&, const addr_t handle_table, const addr_t callback, const addr_t context,
-			emu_object<std::uint64_t> handle) -> bool
+		[st = &state](vcpu& cpu, const addr_t table_address, const addr_t callback,
+			const addr_t context, emu_object<std::uint64_t> found_handle) -> bool
 		{
-			if (handle)
-				handle.write(0);
-
-			THREAD_LOG_WARN("ExEnumHandleTable(table=0x{:X}, callback=0x{:X}, context=0x{:X}): "
-				"nothing here calls back into the guest, so no handle is enumerated",
-				handle_table, callback, context);
-
+			if (!table_address || !callback) return false;
+			const auto selected = st->find_handle_table(table_address);
+			if (!selected || !selected->reference()) return false;
+			auto& table = *selected;
+			struct table_reference
+			{
+				win_handle_table& table;
+				~table_reference() { table.dereference(); }
+			} reference{table};
+			const auto caller = std::dynamic_pointer_cast<win_thread>(cpu.thread());
+			if (!caller || !caller->ethread()) st->fail_ob_notify(cpu, "handle enumeration requires a Windows thread");
+			const auto apc_disable = caller->kernel_apc_disable().read();
+			if (apc_disable == std::numeric_limits<std::int16_t>::min())
+				st->fail_ob_notify(cpu, "handle enumeration critical-region counter overflow");
+			struct critical_region
+			{
+				win_thread& thread;
+				std::int16_t previous;
+				~critical_region() { thread.kernel_apc_disable().write(previous); }
+			} critical{*caller, apc_disable};
+			caller->kernel_apc_disable().write(static_cast<std::int16_t>(apc_disable - 1));
+			const auto snapshot = table.snapshot();
+			auto& space = st->kernel_space();
+			for (const auto& item : snapshot)
+			{
+				if (!item.guest_entry) continue;
+				const auto live = table.lookup_handle(item.handle);
+				if (!live || live->body_addr != item.entry.body_addr) continue;
+				const auto original = space.read_mem<_HANDLE_TABLE_ENTRY>(item.guest_entry);
+				if (!original.Unlocked) st->fail_ob_notify(cpu, "nested enumeration of a locked handle entry");
+				auto locked = original;
+				locked.Unlocked = 0;
+				space.write_mem(item.guest_entry, locked);
+				auto restore = [&]
+				{
+					// A callback may close this handle; never resurrect its guest entry.
+					if (table.lookup_handle(item.handle)) space.write_mem(item.guest_entry, original);
+				};
+				bool found = false;
+				try
+				{
+					const std::uint64_t args[] = {table_address, item.guest_entry, item.handle, context};
+					const auto sleep = caller ? caller->sleep_until() : thread::time_point{};
+					struct callback_scope
+					{
+						callback_scope() { ++win::ob_callback_depth; }
+						~callback_scope() { --win::ob_callback_depth; }
+					} callback_guard;
+					found = (win::call_with_attachment_checkpoint(st->calls, cpu, callback, args, 0,
+						[&] { return cpu.execution_failed() || (caller &&
+							(caller->is_finished() || caller->is_waiting() || caller->sleep_until() != sleep)); }) & 0xffu) != 0;
+					if (caller->kernel_apc_disable().read() != apc_disable - 1)
+						st->fail_ob_notify(cpu, "handle enumeration callback returned with unbalanced critical region");
+					if (table.lookup_handle(item.handle))
+					{
+						const auto after = space.read_mem<_HANDLE_TABLE_ENTRY>(item.guest_entry);
+						if (std::memcmp(&after, &original, sizeof(after)) != 0)
+							st->fail_ob_notify(cpu, "ExEnumHandleTable callback must unlock entry without changing metadata");
+					}
+				}
+				catch (...) { restore(); throw; }
+				restore();
+				if (found)
+				{
+					if (found_handle) found_handle.write(item.handle);
+					return true;
+				}
+			}
 			return false;
 		});
+
+	// Some PDBs expose this private helper; exported-only images use an inline increment.
+	if (mod.find_symbol("ExUnlockHandleTableEntry"))
+		state.redirect(mod, "ExUnlockHandleTableEntry",
+			[st = &state](vcpu&, addr_t table_address, addr_t entry_address)
+			{
+				if (const auto table = st->find_handle_table(table_address))
+					for (const auto& entry : table->snapshot())
+						if (entry.guest_entry == entry_address)
+						{
+							auto value = st->kernel_space().read_mem<_HANDLE_TABLE_ENTRY>(entry_address);
+							value.Unlocked = 1;
+							st->kernel_space().write_mem(entry_address, value);
+							return;
+						}
+			});
 
 	// Nothing builds the directories these names would hang off, so opening one makes it.
 	auto attribute_name = [](vcpu& cpu, const emu_object<_OBJECT_ATTRIBUTES>& object_attributes)
@@ -349,11 +423,11 @@ void modules::register_ntoskrnl_object_ops(win_kernel_state& state, proc_module&
 		return narrow_wstring(win::read_unicode_string(name));
 	};
 
-	auto open_namespace_object = [st = &state](std::shared_ptr<win_object> host,
-		const std::string& name, const std::uint32_t desired_access) -> std::uint64_t
+	auto open_namespace_object = [st = &state](vcpu& cpu, std::shared_ptr<win_object> host,
+		const std::string& name, const std::uint32_t desired_access, const std::uint32_t attributes) -> std::uint64_t
 	{
 		if (const auto existing = st->objs.lookup_named_object(name))
-			return st->sys_proc->handle_table().create_handle(existing, desired_access);
+			return st->create_handle(cpu, existing, desired_access, attributes);
 
 		const std::array<std::uint8_t, namespace_object_body_size> body{};
 		const auto addr = st->objs.create_object(0, body.data(), body.size(), std::move(host),
@@ -364,7 +438,7 @@ void modules::register_ntoskrnl_object_ops(win_kernel_state& state, proc_module&
 
 		st->objs.register_named_object(name, addr);
 
-		return st->sys_proc->handle_table().create_handle(addr, desired_access);
+		return st->create_handle(cpu, addr, desired_access, attributes);
 	};
 
 	state.redirect_ntzw(mod, "OpenDirectoryObject",
@@ -376,8 +450,8 @@ void modules::register_ntoskrnl_object_ops(win_kernel_state& state, proc_module&
 				return STATUS_INVALID_PARAMETER;
 
 			const auto name = attribute_name(cpu, object_attributes);
-			const auto handle = open_namespace_object(std::make_shared<directory_host>(),
-				name, desired_access);
+			const auto handle = open_namespace_object(cpu, std::make_shared<directory_host>(),
+				name, desired_access, object_attributes ? object_attributes.field(&_OBJECT_ATTRIBUTES::Attributes).read() : 0);
 
 			if (!handle)
 				return STATUS_INSUFFICIENT_RESOURCES;
@@ -428,7 +502,8 @@ void modules::register_ntoskrnl_object_ops(win_kernel_state& state, proc_module&
 			if (host->target.size() > 1 && host->target.back() == '\\')
 				host->target.pop_back();
 
-			const auto handle = open_namespace_object(std::move(host), name, desired_access);
+			const auto handle = open_namespace_object(cpu, std::move(host), name, desired_access,
+				object_attributes ? object_attributes.field(&_OBJECT_ATTRIBUTES::Attributes).read() : 0);
 
 			if (!handle)
 				return STATUS_INSUFFICIENT_RESOURCES;
@@ -442,12 +517,12 @@ void modules::register_ntoskrnl_object_ops(win_kernel_state& state, proc_module&
 		});
 
 	state.redirect_ntzw(mod, "QuerySymbolicLinkObject",
-		[st = &state](vcpu&, const std::uint64_t link_handle,
+		[st = &state](vcpu& cpu, const std::uint64_t link_handle,
 			emu_object<_UNICODE_STRING> link_target,
 			emu_object<std::uint32_t> returned_length) -> NTSTATUS
 		{
 			const auto host =
-				st->sys_proc->handle_table().get_object<symbolic_link_host>(link_handle);
+				st->get_handle_object<symbolic_link_host>(cpu, link_handle);
 
 			if (!host)
 			{

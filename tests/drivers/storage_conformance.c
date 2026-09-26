@@ -258,9 +258,24 @@ static void previous_mode_io_tests(HANDLE disk)
         "nt-read-usermode-kernel-iosb-preserved", "nt-write-usermode-kernel-iosb-preserved",
         "zw-read-kernel-bypasses-previousmode", "zw-write-kernel-bypasses-previousmode"
     };
-    UNICODE_STRING name; RAW_IO io; IO_STATUS_BLOCK iosb, saved_iosb;
-    LARGE_INTEGER offset; NTSTATUS status; ULONG i;
+    static const char *invalid_labels[] = {
+        "nt-read-invalid-handle-kernel-iosb-preserved", "nt-write-invalid-handle-kernel-iosb-preserved"
+    };
+    static const char *kernel_labels[] = {
+        "nt-read-kernel-handle-kernel-iosb-preserved", "nt-write-kernel-handle-kernel-iosb-preserved"
+    };
+    UNICODE_STRING name; OBJECT_ATTRIBUTES attributes; RAW_IO io; IO_STATUS_BLOCK iosb, saved_iosb;
+    LARGE_INTEGER offset; NTSTATUS status; ULONG i, j; HANDLE local_disk = NULL;
     volatile UCHAR *previous; UCHAR saved_mode;
+    /* Nt pointer checks need a process-local handle; Zw retains the kernel handle. */
+    RtlInitUnicodeString(&name,L"\\Device\\Harddisk0\\DR0");
+    InitializeObjectAttributes(&attributes,&name,OBJ_CASE_INSENSITIVE,NULL,NULL);
+    status = ZwCreateFile(&local_disk,GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE,
+        &attributes,&iosb,NULL,0,FILE_SHARE_READ | FILE_SHARE_WRITE,
+        FILE_OPEN,FILE_SYNCHRONOUS_IO_NONALERT,NULL,0);
+    check(result(status,&iosb,STATUS_SUCCESS,FILE_OPENED) && local_disk != NULL,
+        "raw-io-process-local-disk-open");
+    if (!NT_SUCCESS(status) || !local_disk) return;
     /* Guest ABI fixed by types_x64.hpp, ntkrnlmp.pdb
      * 8CB8E27C9BCA95EA7FD026E739740C9D1: KTHREAD.PreviousMode is 0x232.
      * Restore before diagnostics or other kernel services, including on exceptions. */
@@ -271,20 +286,25 @@ static void previous_mode_io_tests(HANDLE disk)
         io = (RAW_IO)MmGetSystemRoutineAddress(&name);
         check(io != NULL,"raw-io-api-resolved");
         if (!io) continue;
-        reset_output();
-        RtlFillMemory(&iosb,sizeof(iosb),0xcc); saved_iosb = iosb;
-        saved_mode = *previous;
-        __try {
-            *previous = UserMode;
-            status = io(disk,NULL,NULL,NULL,&iosb,output.data,512,&offset,NULL);
-        } __finally {
-            *previous = saved_mode;
+        for (j=0; j<(i < 2 ? 3u : 1u); ++j) {
+            HANDLE target = i >= 2 ? disk : j == 0 ? local_disk : j == 1 ? NULL : disk;
+            reset_output();
+            RtlFillMemory(&iosb,sizeof(iosb),0xcc); saved_iosb = iosb;
+            saved_mode = *previous;
+            __try {
+                *previous = UserMode;
+                status = io(target,NULL,NULL,NULL,&iosb,output.data,512,&offset,NULL);
+            } __finally {
+                *previous = saved_mode;
+            }
+            check(untouched(0) && (i < 2 ?
+                (status == STATUS_ACCESS_VIOLATION &&
+                 RtlCompareMemory(&iosb,&saved_iosb,sizeof(iosb)) == sizeof(iosb)) :
+                result(status,&iosb,STATUS_INVALID_DEVICE_REQUEST,0)),
+                j == 0 ? labels[i] : j == 1 ? invalid_labels[i] : kernel_labels[i]);
         }
-        check(untouched(0) && (i < 2 ?
-            (status == STATUS_ACCESS_VIOLATION &&
-             RtlCompareMemory(&iosb,&saved_iosb,sizeof(iosb)) == sizeof(iosb)) :
-            result(status,&iosb,STATUS_INVALID_DEVICE_REQUEST,0)),labels[i]);
     }
+    check(ZwClose(local_disk) == STATUS_SUCCESS,"raw-io-process-local-disk-close");
 }
 static void pointer_and_io_tests(HANDLE disk)
 {

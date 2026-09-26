@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cstring>
 #include <functional>
+#include <optional>
 #include <string_view>
 #include <vector>
 
@@ -128,6 +129,7 @@ static_assert(sizeof(file_standard_information_t) == 0x18);
 static_assert(sizeof(file_network_open_information_t) == 0x38);
 static_assert(sizeof(file_directory_information_t) == 0x40);
 
+// RootDirectory-relative file paths remain unsupported; only ObjectName is resolved.
 std::string object_path(vcpu& cpu, const emu_object<_OBJECT_ATTRIBUTES>& object_attributes)
 {
 	auto& space = *cpu.curr_addr_space();
@@ -164,8 +166,12 @@ struct open_result
 // the handle carries.
 open_result open_device(vcpu& cpu, win_kernel_state& state, const addr_t device,
 	const std::string& path, emu_object<std::uint64_t> file_handle,
-	std::uint32_t access, std::uint32_t disposition, std::uint32_t options)
+	std::uint32_t access, std::uint32_t disposition, std::uint32_t options,
+	const std::uint32_t attributes)
 {
+	// Reject forbidden kernel handles before the driver acquires per-open state.
+	if ((attributes & 0x200u) && state.handle_mode(cpu) != 0)
+		return {STATUS_INVALID_PARAMETER, 0};
 	const auto device_host_object = state.objs.get_object<device_host>(device);
 	const bool builtin = device_host_object && device_host_object->builtin;
 	if (builtin)
@@ -191,8 +197,29 @@ open_result open_device(vcpu& cpu, win_kernel_state& state, const addr_t device,
 		if (!file_object)
 			return { STATUS_INSUFFICIENT_RESOURCES, 0 };
 
+		bool created = false;
+		std::shared_ptr<file_host> host;
 		// This guard belongs to the call, never to file_host (pool dies before objs).
-		auto release_failed_open = [&](void*) { if (builtin) state.pool.free(file_object); };
+		// A successful CREATE must be paired even when no handle was published.
+		auto release_failed_open = [&](void*)
+		{
+			if (created)
+				for (const auto major : {irp_mj_cleanup, irp_mj_close})
+				{
+					try
+					{
+						emulator->dispatch_irp(cpu, {.major = major, .device_object = device,
+							.file_object = file_object});
+					}
+					catch (...)
+					{
+						THREAD_LOG_WARN("open_device('{}'): rollback IRP {} failed", path,
+							static_cast<unsigned>(major));
+					}
+				}
+			if (host) host->file_object = 0;
+			state.pool.free(file_object);
+		};
 		std::unique_ptr<void, decltype(release_failed_open)> pool_guard(
 			reinterpret_cast<void*>(file_object), release_failed_open);
 		_FILE_OBJECT body{};
@@ -207,22 +234,22 @@ open_result open_device(vcpu& cpu, win_kernel_state& state, const addr_t device,
 			.device_object = device,
 			.file_object = file_object,
 		});
+		created = (result.status & 0x80000000u) == 0;
 
-		auto host = std::make_shared<file_host>();
+		host = std::make_shared<file_host>();
 		host->path = path;
 		host->device_object = device;
 		host->file_object = file_object;
 		host->builtin = builtin;
 
 		const std::uint8_t placeholder[sizeof(addr_t)] = {};
-		const auto addr = (result.status & 0x80000000u) == 0
+		const auto addr = created
 			? state.objs.create_object(0, placeholder, sizeof(placeholder), host,
 				prot_rw | prot_supervisor)
 			: 0;
 
 		if (!addr)
 		{
-			if (!builtin) state.pool.free(file_object);
 			THREAD_LOG_WARN("open_device('{}') refused, status=0x{:X}", path,
 				static_cast<std::uint32_t>(result.status));
 			return { (result.status & 0x80000000u) != 0 ? result.status : STATUS_INSUFFICIENT_RESOURCES, 0 };
@@ -230,15 +257,16 @@ open_result open_device(vcpu& cpu, win_kernel_state& state, const addr_t device,
 
 		if (file_handle)
 		{
-			const auto handle = state.sys_proc->handle_table().create_handle(addr, builtin ? access : 0);
+			const auto handle = state.create_handle(cpu, addr, builtin ? access : 0, attributes);
+			if (!handle)
+			{
+				return {STATUS_INSUFFICIENT_RESOURCES, 0};
+			}
 			try { file_handle.write(handle); }
 			catch (...)
 			{
-				if (builtin)
-				{
-					state.sys_proc->handle_table().close_handle(handle);
-					host->file_object = 0;
-				}
+				// Roll back our own handle even when it carries OBJ_KERNEL_HANDLE.
+				state.close_handle(cpu, handle, 0);
 				throw;
 			}
 		}
@@ -315,9 +343,9 @@ open_result write_file_information(addr_space& space, const file_host& host,
 	}
 }
 
-open_result open_file(win_kernel_state& state, const std::string& path,
+open_result open_file(vcpu& cpu, win_kernel_state& state, const std::string& path,
 	const std::uint32_t disposition, const std::uint32_t create_options,
-	emu_object<std::uint64_t> file_handle)
+	emu_object<std::uint64_t> file_handle, const std::uint32_t attributes)
 {
 	if (path.empty())
 		return { STATUS_OBJECT_NAME_INVALID, 0 };
@@ -347,7 +375,16 @@ open_result open_file(win_kernel_state& state, const std::string& path,
 			return { STATUS_INSUFFICIENT_RESOURCES, 0 };
 
 		if (file_handle)
-			file_handle.write(state.sys_proc->handle_table().create_handle(addr, 0));
+		{
+			const auto handle = state.create_handle(cpu, addr, 0, attributes);
+			if (!handle) return {STATUS_INSUFFICIENT_RESOURCES, 0};
+			try { file_handle.write(handle); }
+			catch (...)
+			{
+				state.close_handle(cpu, handle, 0);
+				return {STATUS_ACCESS_VIOLATION, 0};
+			}
+		}
 
 		return { STATUS_SUCCESS, file_opened };
 	}
@@ -410,7 +447,16 @@ open_result open_file(win_kernel_state& state, const std::string& path,
 		return { STATUS_INSUFFICIENT_RESOURCES, 0 };
 
 	if (file_handle)
-		file_handle.write(state.sys_proc->handle_table().create_handle(addr, 0));
+	{
+		const auto handle = state.create_handle(cpu, addr, 0, attributes);
+		if (!handle) return {STATUS_INSUFFICIENT_RESOURCES, 0};
+		try { file_handle.write(handle); }
+		catch (...)
+		{
+			state.close_handle(cpu, handle, 0);
+			return {STATUS_ACCESS_VIOLATION, 0};
+		}
+	}
 
 	return { STATUS_SUCCESS, information };
 }
@@ -574,6 +620,7 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 			const std::uint32_t create_file_type, const addr_t extra_create_parameters,
 			const std::uint32_t options, const addr_t driver_context) -> NTSTATUS
 		{
+			// As with NtCreateFile, RootDirectory-relative names are unsupported.
 			auto& space = *cpu.curr_addr_space();
 
 			const emu_object<_UNICODE_STRING> name_obj(space, object_attributes
@@ -590,14 +637,16 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 				ea_buffer, ea_length, create_file_type, extra_create_parameters, options,
 				driver_context, allocation_size);
 
-			if (file_handle)
-				file_handle.write(0);
+			if (!file_handle)
+				return STATUS_INVALID_PARAMETER;
 
 			const auto device = st->find_device(path);
 
 			const auto result = device
-				? open_device(cpu, *st, device, path, file_handle, desired_access, disposition, create_options)
-				: open_file(*st, path, disposition, create_options, file_handle);
+				? open_device(cpu, *st, device, path, file_handle, desired_access, disposition, create_options,
+					object_attributes ? object_attributes.field(&_OBJECT_ATTRIBUTES::Attributes).read() : 0)
+				: open_file(cpu, *st, path, disposition, create_options, file_handle,
+					object_attributes ? object_attributes.field(&_OBJECT_ATTRIBUTES::Attributes).read() : 0);
 
 			write_status_block(io_status_block, result);
 
@@ -690,15 +739,17 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 	{
 		const auto path = object_path(cpu, object_attributes);
 
-		if (file_handle)
-			file_handle.write(0);
+		if (!file_handle)
+			return STATUS_INVALID_PARAMETER;
 
 		// A device name is not in the filesystem, so it is resolved before it can be missed.
 		const auto device = st->find_device(path);
 
 		const auto result = device
-			? open_device(cpu, *st, device, path, file_handle, desired_access, create_disposition, create_options)
-			: open_file(*st, path, create_disposition, create_options, file_handle);
+			? open_device(cpu, *st, device, path, file_handle, desired_access, create_disposition, create_options,
+				object_attributes ? object_attributes.field(&_OBJECT_ATTRIBUTES::Attributes).read() : 0)
+			: open_file(cpu, *st, path, create_disposition, create_options, file_handle,
+				object_attributes ? object_attributes.field(&_OBJECT_ATTRIBUTES::Attributes).read() : 0);
 
 		write_status_block(io_status_block, result);
 
@@ -718,14 +769,16 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 		{
 			const auto path = object_path(cpu, object_attributes);
 
-			if (file_handle)
-				file_handle.write(0);
+			if (!file_handle)
+				return STATUS_INVALID_PARAMETER;
 
 			const auto device = st->find_device(path);
 
 			const auto result = device
-				? open_device(cpu, *st, device, path, file_handle, desired_access, file_open, open_options)
-				: open_file(*st, path, file_open, open_options, file_handle);
+				? open_device(cpu, *st, device, path, file_handle, desired_access, file_open, open_options,
+					object_attributes ? object_attributes.field(&_OBJECT_ATTRIBUTES::Attributes).read() : 0)
+				: open_file(cpu, *st, path, file_open, open_options, file_handle,
+					object_attributes ? object_attributes.field(&_OBJECT_ATTRIBUTES::Attributes).read() : 0);
 
 			write_status_block(io_status_block, result);
 
@@ -742,7 +795,8 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 		const std::uint32_t length, emu_object<std::int64_t> byte_offset,
 		[[maybe_unused]] emu_object<std::uint32_t> key, const bool zw) -> NTSTATUS
 	{
-		const auto host = st->sys_proc->handle_table().get_object<file_host>(file_handle);
+		const auto host = st->get_handle_object<file_host>(cpu, file_handle,
+			zw && !win::executing_user_mode(cpu) ? std::optional<std::uint8_t>{0} : std::nullopt);
 
 		if (host && host->builtin)
 		{
@@ -807,7 +861,8 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 		const std::uint32_t length, emu_object<std::int64_t> byte_offset,
 		[[maybe_unused]] emu_object<std::uint32_t> key, const bool zw) -> NTSTATUS
 	{
-		const auto host = st->sys_proc->handle_table().get_object<file_host>(file_handle);
+		const auto host = st->get_handle_object<file_host>(cpu, file_handle,
+			zw && !win::executing_user_mode(cpu) ? std::optional<std::uint8_t>{0} : std::nullopt);
 
 		if (host && host->builtin)
 		{
@@ -884,7 +939,7 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 		emu_object<_IO_STATUS_BLOCK> io_status_block, const addr_t file_information,
 		const std::uint32_t length, const std::uint32_t file_information_class) -> NTSTATUS
 	{
-		const auto host = st->sys_proc->handle_table().get_object<file_host>(file_handle);
+		const auto host = st->get_handle_object<file_host>(cpu, file_handle);
 
 		if (!host || !host->file)
 		{
@@ -904,10 +959,10 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 		return status.status;
 	};
 
-	auto flush_buffers_file = [st](vcpu&, const std::uint64_t file_handle,
+	auto flush_buffers_file = [st](vcpu& cpu, const std::uint64_t file_handle,
 		emu_object<_IO_STATUS_BLOCK> io_status_block) -> NTSTATUS
 	{
-		const auto host = st->sys_proc->handle_table().get_object<file_host>(file_handle);
+		const auto host = st->get_handle_object<file_host>(cpu, file_handle);
 
 		if (!host)
 		{
@@ -932,7 +987,7 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 		const bool return_single_entry, emu_object<_UNICODE_STRING> file_name,
 		const bool restart_scan) -> NTSTATUS
 	{
-		const auto host = st->sys_proc->handle_table().get_object<file_host>(file_handle);
+		const auto host = st->get_handle_object<file_host>(cpu, file_handle);
 
 		if (!host)
 		{
@@ -1042,7 +1097,7 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 		emu_object<_IO_STATUS_BLOCK> io_status_block, const addr_t fs_information,
 		const std::uint32_t length, const std::uint32_t fs_information_class) -> NTSTATUS
 	{
-		const auto host = st->sys_proc->handle_table().get_object<file_host>(file_handle);
+		const auto host = st->get_handle_object<file_host>(cpu, file_handle);
 
 		if (!host)
 		{
@@ -1088,12 +1143,23 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 		{
 			if (zw && (!mod.find_symbol(zw_name) || mod.find_symbol(zw_name) == mod.find_symbol(nt))) continue;
 			state.redirect(mod, zw ? zw_name : nt,
-				[read_file, write_file, writing, zw](vcpu& cpu, const std::uint64_t file_handle,
+				[st, read_file, write_file, writing, zw](vcpu& cpu, const std::uint64_t file_handle,
 					const std::uint64_t event, const addr_t apc_routine, const addr_t apc_context,
 					emu_object<_IO_STATUS_BLOCK> io_status_block, const addr_t buffer,
 					const std::uint32_t length, emu_object<std::int64_t> byte_offset,
 					emu_object<std::uint32_t> key) -> NTSTATUS
 				{
+					// Probe before handle rejection or any file/status writes: host copies
+					// do not enforce the effective caller's user-memory permissions.
+					try
+					{
+						const bool user = win::executing_user_mode(cpu) || (!zw && st->handle_mode(cpu) != 0);
+						if (user && !process_memory_copy::capture(st->current_process(cpu),
+							*cpu.curr_addr_space(), io_status_block.address(), nullptr,
+							sizeof(_IO_STATUS_BLOCK), true, true)) return STATUS_ACCESS_VIOLATION;
+					}
+					catch (...) { return STATUS_ACCESS_VIOLATION; }
+
 					if (writing) return write_file(cpu, file_handle, event, apc_routine, apc_context,
 						std::move(io_status_block), buffer, length, std::move(byte_offset), std::move(key), zw);
 					return read_file(cpu, file_handle, event, apc_routine, apc_context,
@@ -1130,7 +1196,8 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 		const addr_t output_buffer, const std::uint32_t output_length,
 		const std::string_view who, bool zw = false, bool filesystem_control = false) -> NTSTATUS
 	{
-		const auto host = st->sys_proc->handle_table().get_object<file_host>(file_handle);
+		const auto host = st->get_handle_object<file_host>(cpu, file_handle,
+			zw && !win::executing_user_mode(cpu) ? std::optional<std::uint8_t>{0} : std::nullopt);
 
 		if (!host)
 		{
@@ -1166,7 +1233,7 @@ void modules::register_ntoskrnl_io_ops(win_kernel_state& state, proc_module& mod
 				const auto previous = thread->ethread().field(&_ETHREAD::Tcb).field(&_KTHREAD::PreviousMode).read();
 				if (previous != 0 && previous != 1) return STATUS_INVALID_PARAMETER;
 				context.user = win::executing_user_mode(cpu) || (!zw && previous != 0);
-				const auto entry = st->sys_proc->handle_table().lookup_handle(file_handle);
+				const auto entry = st->lookup_handle(cpu, file_handle, context.user ? 1 : 0);
 				if (!entry) return STATUS_INVALID_HANDLE;
 				const auto required = (control_code >> 14) & 3u;
 				if (context.user && (entry->access & required) != required)
