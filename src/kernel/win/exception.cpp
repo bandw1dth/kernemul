@@ -181,6 +181,13 @@ bool win_exception::handle(vcpu& cpu, const cpu_exception ex)
 		if (disposition == exception_execute_handler && answered.target_ip)
 		{
 			LOG_INFO("exception handled at frame {} -> 0x{:X}", depth, answered.target_ip);
+#if defined(KERNEMUL_ARCH_X64)
+			// __C_specific_handler passes the sign-extended exception code to
+			// RtlUnwindEx as its return value. The selected handler consumes RAX
+			// for GetExceptionCode(); the personality call restored the old RAX.
+			emulator->emu().call_conv()->ret(cpu,
+				static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(code))));
+#endif
 			cpu.set_pc(answered.target_ip);
 			cpu.set_sp(answered.establisher_frame);
 			return true;
