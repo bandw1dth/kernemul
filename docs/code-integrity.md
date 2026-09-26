@@ -66,3 +66,25 @@ stack storage, both policy outputs, output guards, optional outputs, repeated
 cleanup, catalog output positions, and controlled invalid-pointer failures.
 Use `tests/scripts/build-ci.ps1`, then run `ci_conformance` through
 `tests/scripts/run-conformance.ps1`; never load the fixture as a host driver.
+
+## Verification on 2026-09-26
+
+The same CI fixture produces 44 failing assertions on the preceding executable,
+including all four mapped ninth-slot canaries being overwritten and two CI hook
+faults. On the corrected executable, all 52 CI assertions pass, as do the 15
+thread-ownership checks. Independent source review found no material issues.
+
+The kernel-only WHP capture in `build-conformance/kernel-20260926-130632-839`
+lasts 210.039 seconds and is stopped at its requested limit. Initialization
+returns zero. All eight signed-file requests return without hook or output-memory
+faults, compared with four CI hook faults in the preceding capture. The
+three-minute timer expires and subsequent reads return true 19 times. There are
+no missing-export, callback-failure, or unhandled-exception diagnostics; 144
+handled exceptions and other subsystem warnings remain.
+
+The guest kernel is 10.0.26100.9444 and the guest CI DLL is 10.0.19041.6456; this
+is a mixed guest image set, not a stock Windows installation. The manifest pins
+both hashes. The capture uses the existing user-provided in-memory compatibility
+patch on a separate local lab branch. No user-mode service is launched and the
+driver file is unchanged. This validates the CI boundary, not certificate trust
+or the correctness of every monitoring path.
