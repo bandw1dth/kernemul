@@ -72,6 +72,59 @@ failures in `irql_conformance-20260926-214834-912.stdout.log`. Its high-IRQL
 wait/delay/yield operations incorrectly return. The fatal-fault control already
 stops promptly in that baseline and must continue to do so after the change.
 
+## Validation on 2026-09-26
+
+Implementation commit: `b85cf25`. Validated generic x64/WHP executable SHA-256:
+`79EC91369EBBB811169AD8E8CE1E66C18491C3962F1D2BD0D98B07E4006A608E`.
+The executable and runtime DLLs are frozen under
+`build-conformance/irql-scheduling-validated-20260926`.
+
+Independent verification completed **15 fixture runs: 265 positive assertions
+and nine negative cases, all passing**. These include 49 new IRQL assertions,
+five new rejection/fatal-stop cases, and existing timer, callback, process-attach,
+CI, and callback/DPC failure regressions. Every runner exited zero; expected
+negative guest executions exited one. None timed out; stderr was empty.
+
+Evidence is in `build-conformance/irql_conformance-20260926-220047-106.json`, the
+five `irql_failure_*-20260926-220040-*` through `220042-*` manifests, and regression
+manifests from `timer_conformance-20260926-220100-474.json` through
+`ci_verification-20260926-220121-484.json`. The attach harness used both companion
+guest processes. Review found no further material issue after the final guard fix.
+
+Runtime coverage is x64/WHP with one vCPU. ARM64 and multiprocessor behavior were
+not execution-tested in this pass.
+
+### Hyper-V target capture
+
+`build-conformance/kernel-20260926-220301-430` ran `vgk.sys` with the
+`process_notify_user.exe` companion for **210.039 seconds**. The harness stopped
+it at the configured limit (`stoppedAtLimit=true`, forced-stop exit code `-1`);
+this is a bounded capture, not a graceful driver unload.
+
+The local-only lab commit is `f16edfe`, based on generic commit `b85cf25`. Lab
+executable SHA-256: `2718335DF78AB3FF29CB3B7DE8D5FC4AECA3002ABE106A5EF929B1F0EDB1486C`.
+The target's unchanged on-disk SHA-256 is
+`3CB2F36CF9F3B66BF63561D24649422D852229F2C788A7AAA783752DCE4AB39F`.
+The generic checkout and validated executable were restored during the frozen run.
+
+- Driver initialization returned `STATUS_SUCCESS` at 22:03:08.088.
+- Four process create/exit callback deliveries and four attach/detach pairs completed.
+  The companion exited with its expected `0x1234` status; `vgc.exe` was not launched.
+- The three-minute timer first returned true at 22:06:04.350, with **19 true reads**.
+- **147 handled exceptions, zero unhandled faults, zero faulted API executions,
+  zero callback IRQL failures, and zero unimplemented API executions** were recorded.
+- Both system-image SHA-256 signatures still verified; six nonmatching digest
+  algorithm probes correctly failed. No CI backend-unavailable result occurred.
+
+Stderr was empty. Three startup error-level messages report optional hook symbols
+absent from the mapped kernel (`KeRaiseIrql`, `KfLowerIrql`, and
+`KeRaiseIrqlToSynchLevel`); they are not guest API execution failures. VGK still
+emits the existing `E00000EF` diagnostic for `fltmgr.sys`. This scheduling pass
+does not resolve remaining CI policy fields or firmware/storage fidelity.
+
+The capture manifest, stdout/stderr, frozen executable, and `analysis-counts.json`
+remain in that ignored local directory. Only the generic branch is published.
+
 ## Contract sources
 
 - [Spinlock acquisition raises IRQL](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-keacquirespinlock)

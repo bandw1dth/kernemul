@@ -153,6 +153,10 @@ that no other ordinary thread runs until IRQL lowers. APC_LEVEL preservation and
 shutdown responsiveness need separate checks. The callback guard must remain.
 This work is deliberately outside the current cryptographic verification scope.
 
+The subsequent [IRQL scheduling pass](irql-scheduling.md) fixed that scheduler
+failure and completed a 210-second target capture through timer expiry. The
+cryptographic outcomes and remaining `fltmgr.sys` diagnostic were unchanged.
+
 ## Sources
 
 - [Microsoft Code Integrity security policy](https://csrc.nist.gov/CSRC/media/projects/cryptographic-module-validation-program/documents/security-policies/140sp3644.pdf)
