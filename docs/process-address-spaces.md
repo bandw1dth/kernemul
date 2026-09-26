@@ -138,6 +138,31 @@ Release executable is preserved in
 `362BCCBCEB88D2B3E78FB0AF70BF85843FD91230C36B628825E2C00A85F2DDAC`.
 Independent review reported no outstanding material findings after both fixes.
 
+## Target capture
+
+`build-conformance/kernel-20260926-143706-657` completed 210.043 seconds under
+Hyper-V and was deliberately stopped at the requested limit. The frozen lab
+executable used local commit `bd77aa5`, containing the user's in-memory DEBUGCTL
+compatibility patch. The generic branch and executable were restored; the lab
+patch is excluded from the published branch. No vgc.exe service was launched.
+
+- Four real attach/detach pairs switched from System PID 4 to guest PID 196 and
+  restored System at depth zero. Two pairs occurred inside the Ex process-create
+  callback; two followed during the guest's setup.
+- All four process callback BEGIN records matched END records. The native guest
+  exited with 0x1234, and its PID was unpublished.
+- No unhandled exceptions, faulted hooks, callback failures, or missing runtime
+  APIs occurred. There were 146 handled exceptions, eight CiCheckSignedFile calls,
+  and three known optional IRQL hook-symbol setup diagnostics. Stderr was empty.
+- The three-minute timer expired; its subsequent state reads returned true 19
+  times. Driver and native guest file hashes stayed unchanged.
+
+The capture's `manifest.json` pins executable and guest identities;
+`analysis.json` retains the counts and relevant callback/attachment records.
+This validates the target's observed attachment paths. The two-process fixture,
+rather than this target capture alone, validates cross-process copy permissions,
+partial transfers, and native handle rejection.
+
 ## Sources
 
 - [KeStackAttachProcess](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-kestackattachprocess)
