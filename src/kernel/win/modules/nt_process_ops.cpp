@@ -7,6 +7,7 @@
 #include "../status.hpp"
 #include "../types.hpp"
 #include "../../../util/log.hpp"
+#include <cstddef>
 #include <memory>
 #include <set>
 #include <string_view>
@@ -21,6 +22,9 @@ struct notify_routines
 
 // What NT's fixed-size tables hold, and what a driver past the limit is told.
 constexpr std::size_t max_process_notify_routines = 64;
+
+static_assert(offsetof(_EPROCESS, Pcb) == 0,
+	"PsGetThreadProcess returns the containing EPROCESS for its KPROCESS pointer");
 
 NTSTATUS add_notify(std::set<addr_t>& routines, const std::size_t limit,
 	const std::string_view who, const addr_t routine)
@@ -246,6 +250,29 @@ void modules::register_ntoskrnl_process_ops(win_kernel_state& state, proc_module
 			THREAD_LOG_INFO("PsLookupThreadByThreadId({}) -> 0x{:X}", thread_id, ethread);
 
 			return STATUS_SUCCESS;
+		});
+
+	state.redirect(mod, "PsGetThreadProcess",
+		[](vcpu&, emu_object<_ETHREAD> thread) -> addr_t
+		{
+			if (!thread)
+			{
+				THREAD_LOG_WARN("PsGetThreadProcess: null thread");
+				return 0;
+			}
+
+			const auto process = guest_va(thread.field(&_ETHREAD::Tcb)
+				.field(&_KTHREAD::Process).read());
+
+			if (!process)
+			{
+				THREAD_LOG_WARN("PsGetThreadProcess(0x{:X}): no owning process", thread.address());
+				return 0;
+			}
+
+			THREAD_LOG_INFO("PsGetThreadProcess(0x{:X}) -> 0x{:X}", thread.address(), process);
+
+			return process;
 		});
 
 	state.redirect(mod, "PsTerminateSystemThread",
