@@ -8,6 +8,9 @@ static volatile LONG exe_images, ntdll_images;
 static HANDLE accepted_pid, rejected_pid, initial_tid, launcher_tid;
 static PEPROCESS retained_process;
 static BOOLEAN registered[5];
+static LARGE_INTEGER registry_cookie;
+static BOOLEAN registry_registered;
+static volatile LONG user_registry_calls;
 
 static void check(BOOLEAN ok, const char* label)
 {
@@ -177,8 +180,21 @@ static void image_observer(PUNICODE_STRING name, HANDLE pid, PIMAGE_INFO info)
     } else check(FALSE, "unexpected-user-image");
 }
 
+static NTSTATUS registry_observer(PVOID context, PVOID kind, PVOID information)
+{
+    UNREFERENCED_PARAMETER(context); UNREFERENCED_PARAMETER(kind);
+    UNREFERENCED_PARAMETER(information);
+    if (PsGetCurrentProcessId() == (HANDLE)4) return STATUS_SUCCESS;
+    check(PsGetCurrentProcessId() == accepted_pid &&
+        PsGetCurrentThreadId() == initial_tid && KeGetCurrentIrql() == PASSIVE_LEVEL,
+        "registry-callback-from-user-loader-has-kernel-pcr-and-subject");
+    InterlockedIncrement(&user_registry_calls);
+    return STATUS_SUCCESS;
+}
+
 static void unregister_all(void)
 {
+    if (registry_registered) check(CmUnRegisterCallback(registry_cookie) == STATUS_SUCCESS, "remove-registry");
     if (registered[4]) check(PsRemoveLoadImageNotifyRoutine(image_observer) == STATUS_SUCCESS, "remove-image");
     if (registered[3]) check(PsRemoveCreateThreadNotifyRoutine(thread_observer) == STATUS_SUCCESS, "remove-thread");
     if (registered[2]) check(PsSetCreateProcessNotifyRoutine(classic, TRUE) == STATUS_SUCCESS, "remove-classic");
@@ -235,6 +251,7 @@ static void monitor(PVOID unused)
     check(retained_process && KeWaitForSingleObject(retained_process, Executive,
         KernelMode, FALSE, &poll) == STATUS_SUCCESS, "exited-process-object-signaled-after-pid-removal");
     if (retained_process) ObDereferenceObject(retained_process);
+    check(user_registry_calls > 0, "user-loader-registry-callbacks-delivered-before-ring3-entry");
     unregister_all();
     DbgPrint("PROCESS_NOTIFY COMPLETE\n");
     DbgPrint("CONFORMANCE RESULT failures=%ld\n", failures);
@@ -253,6 +270,13 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driver, PUNICODE_STRING path)
     registered[1] = NT_SUCCESS(PsSetCreateProcessNotifyRoutineEx(ex_secondary, FALSE));
     registered[3] = NT_SUCCESS(PsSetCreateThreadNotifyRoutine(thread_observer));
     registered[4] = NT_SUCCESS(PsSetLoadImageNotifyRoutine(image_observer));
+    {
+        UNICODE_STRING altitude;
+        RtlInitUnicodeString(&altitude, L"321004.1");
+        registry_registered = NT_SUCCESS(CmRegisterCallbackEx(registry_observer, &altitude,
+            driver, NULL, &registry_cookie, NULL));
+        check(registry_registered, "register-user-loader-registry-observer");
+    }
     check(registered[0] && registered[1] && registered[2] && registered[3] && registered[4], "register-all-observers");
     check(!accepted_create[0] && !accepted_create[1] && !rejected_create[0] && !rejected_create[1] &&
         !process_exit[0] && !process_exit[1] && !classic_create && !classic_exit &&

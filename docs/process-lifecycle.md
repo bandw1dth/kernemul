@@ -59,7 +59,9 @@ arbitrary remote termination, a general multi-thread process kill transaction,
 or reclamation of retained guest object bodies. The object manager still retains
 those bodies under its existing ownership model. Unsupported callback paths
 remain explicit failures; registry and object notification execution retain their
-separate bridges. A driver admission veto is an individual launch outcome;
+separate bridges. Registry delivery also saves the actual caller context and uses
+kernel mode, KPCR, and a supervisor stack when invoked from a user syscall.
+A driver admission veto is an individual launch outcome;
 emulator failure or failed driver initialization produces a nonzero host exit.
 Ordinary executable setup failures also fail the host run; the admission-veto
 outcome is recorded separately. Thread completion uses release/acquire publication
@@ -90,7 +92,7 @@ Build and run with `build-drivers.ps1 -Driver 'process_notify_*'`,
 ### Validation on 2026-09-26
 
 The WHP Release build succeeded. All 11 standalone host model programs passed.
-The process positive fixture passed on the final generic executable
+The initial process positive fixture passed on the generic executable
 `3D2974AD0381C5EADB36F9F518943AC326A644DA57809453C99D39D76695A6A3`:
 `build-conformance/process-notify-20260926-134242-709.json` records all 14
 expected markers exactly once, one user termination with status `0x1234`, stable
@@ -108,8 +110,34 @@ for the identified cross-vCPU race.
 All eight new negative/staging cases passed on that final generic executable:
 `build-conformance/process-negative-20260926-134816-343-*.json`. Every run exited
 one without timeout, retained stable artifact hashes, and reached its specific
-expected failure. Creation failures never published/runs a user process; the exit
+expected failure. Creation failures never published or ran a user process; the exit
 failure reached user termination once and stopped before successful exit cleanup.
+
+### Target-driven registry bridge regression
+
+The first process-aware VGK capture (`kernel-20260926-134921-445`, local lab
+commit `e07fd2f`) delivered Ex and classic process creation successfully, then
+stopped after 10.005 seconds in a user-loader registry query. The old registry
+bridge attempted to execute a supervisor callback with the user's ring-3
+registers, TEB context, and stack. The fault occurred at callback entry, before
+any registry payload dereference. The reported zero fault address is not proof
+of a null dereference: this WHP diagnostic reads CR2 without forwarding the raw
+exception parameter/error bits.
+
+Adding a registry observer to the process conformance driver reproduced the
+failure independently (`process-notify-20260926-135120-686`). The regression
+checks the callback's subject PID/TID through kernel PCR access, requires actual
+user-loader registry delivery, and reaches a user program that checks ring-3
+execution after those callbacks. The registry bridge fix preserves the existing
+registry IRQL/APC behavior and callback result while restoring the exact incoming
+architectural context on both return and failure.
+
+After the fix, `process-notify-20260926-135435-685.json` passed with all 14
+lifecycle markers and successful user-loader registry observations. The final
+generic executable hash is
+`7C800BA9C2E4483A8E4BA856BFDED8643C3EA756545D4DB517A7EE23FEE51D7B`.
+Registry conformance and all four registry failure cases also passed on this
+build (`135449` through `135452` manifests).
 
 ## Contract sources
 

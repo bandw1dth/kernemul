@@ -311,21 +311,45 @@ NTSTATUS win_kernel_state::call_registry_notify(vcpu& cpu,
 	const auto kernel = caller->kernel_apc_disable().read();
 	const auto special = caller->special_apc_disable().read();
 	const auto sleep = caller->sleep_until();
+	// Preserve the actual incoming mode and PCR before entering the callback.
+	const auto thread_regs = cpu.arch()->regs();
+	std::vector<reg_t> regs(thread_regs.begin(), thread_regs.end());
+#if defined(KERNEMUL_ARCH_ARM64)
+	// set_pcr also updates this per-CPU register, outside the thread snapshot.
+	regs.push_back(arm64::tpidr_el1);
+#endif
+	std::vector<reg_val> saved(regs.size());
+	for (std::size_t i = 0; i < regs.size(); ++i)
+		cpu.reg_read(regs[i], &saved[i], cpu.arch()->reg_size(regs[i]));
 	auto restore = [&] {
 		emu->set_irql(cpu, irql);
 		caller->kernel_apc_disable().write(kernel);
 		caller->special_apc_disable().write(special);
+		for (std::size_t i = 0; i < regs.size(); ++i)
+			cpu.reg_write(regs[i], &saved[i], cpu.arch()->reg_size(regs[i]));
 	};
 	const std::uint64_t args[] = {registration.value.context, notification, information};
 	++win::registry_callback_depth;
 	try
 	{
+		// Syscall delivery can still have the user's stack and PCR.
+		const pool_block stack(pool, process::default_stack_size, pool_tag("CmSt"));
+		if (!stack.addr()) fail("callback stack allocation failed");
+		emu->set_kernel_mode(cpu, true);
+		const auto pcpu = per_cpu(cpu.id());
+		if (!pcpu) fail("callback requires a per-CPU kernel context");
+		emu->set_pcr(cpu, pcpu->address());
+		cpu.set_sp(stack.addr() + process::default_stack_size - process::stack_reserve);
 		const auto result = static_cast<NTSTATUS>(calls.call(cpu, registration.value.function, args, 0, [&] {
 			if (caller->suspend_count() || caller->is_waiting() || caller->sleep_until() != sleep)
 				fail("callback cannot block or suspend");
 			return cpu.dpc_failed || cpu.execution_failed() || caller->is_finished()
 				|| (scheduler && scheduler->stopped());
 		}));
+		if (cpu.dpc_failed || cpu.execution_failed() || caller->is_finished()
+			|| (scheduler && scheduler->stopped())) fail("callback execution failed");
+		if (caller->suspend_count() || caller->is_waiting() || caller->sleep_until() != sleep)
+			fail("callback cannot block or suspend");
 		if (emu->irql(cpu) != irql || caller->kernel_apc_disable().read() != kernel
 			|| caller->special_apc_disable().read() != special)
 			fail("callback returned with unbalanced IRQL/APC context");
