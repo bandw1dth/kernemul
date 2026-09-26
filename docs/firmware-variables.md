@@ -144,3 +144,45 @@ include firmware queries while attached to another process, physical aliases
 between otherwise distinct output ranges, backend write failures and multi-vCPU
 concurrency. Staging preflights writes; it does not provide atomic visibility
 to concurrent readers.
+
+## Bounded VGK capture
+
+Implementation commit: `8f5f517`. The capture in
+`build-conformance/kernel-20260926-223635-224` ran for **210.038 seconds** and
+was deliberately stopped at its limit (host exit code `-1`). Driver initialization
+returned `STATUS_SUCCESS` at 22:36:41.516. The manifest pins the guest images and
+the separate local lab commit `dd7e5576c6c474a3427f5a8fa4f45aa1af0f0f99`.
+The lab executable has SHA-256
+`2F0DF13362AA6A7A505E16DC8AD15F472CBBB297F9589DCD9D6F96E1547C295E`.
+
+Compared with the preceding IRQL capture (`kernel-20260926-220301-430`):
+
+| Observation | Before | After |
+| --- | --- | --- |
+| Firmware queries | 11 firmware-unavailable responses | 12 queries: 3 successes and 9 absent variables |
+| `BootCurrent` | Unavailable | Success, 2 bytes, attributes `0x06` |
+| `Boot0000` | Unavailable | Two successful reads, 186 bytes, attributes `0x07` |
+| `Boot0001`–`Boot0009` | Firmware unavailable | `STATUS_VARIABLE_NOT_FOUND` (`0xC0000100`) |
+| Unhandled exceptions / API or callback faults | 0 / 0 | 0 / 0 |
+| Signaled reads of the three-minute timer | 19 | 19 |
+
+After reading `BootCurrent`, VGK formats `Boot0000` and retrieves that option;
+its subsequent enumeration reads the same option again. This accounts for the
+extra query. VGK did not query `BootOrder` in this capture; its coherence and
+bytes are covered by the model and guest fixtures.
+
+The first signaled timer read was at 22:39:37.704, and monitoring continued to
+the deadline. There were four delivered process callbacks, four balanced
+attach/detach pairs, 147 handled exceptions, and no executed unimplemented
+functions. CI still reported two trusted SHA-256 checks and six digest/algorithm
+mismatches. The three startup errors remain the known optional IRQL hook names;
+stderr was empty.
+
+The remaining ten storage IOCTL failures, absent physical-memory resource
+registry key and `E00000EF` diagnostic remain. This pass improves firmware
+observations without claiming full platform fidelity or resolving those other
+subsystems. The run included the small process-notification fixture, not the
+user-mode service. The target file remained unchanged at SHA-256
+`3CB2F36CF9F3B66BF63561D24649422D852229F2C788A7AAA783752DCE4AB39F`.
+The generic branch and its validated executable were restored after freezing
+the lab run; the compatibility patch stays on the local lab branch.
