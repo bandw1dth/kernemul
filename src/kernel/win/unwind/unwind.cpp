@@ -60,7 +60,7 @@ handler_result search_scope_table(vcpu& cpu, guest_caller& calls, const scope_se
 			LOG_INFO("  calling filter at 0x{:X}", filter);
 
 			const auto verdict = static_cast<std::int32_t>(
-				calls.call(cpu, filter, args, search.scratch));
+				win::call_with_attachment_checkpoint(calls, cpu, filter, args, search.scratch));
 
 			LOG_INFO("  filter returned {}", verdict);
 

@@ -44,6 +44,8 @@
 
 struct win_kernel_state : kernel_state
 {
+	[[nodiscard]] std::shared_ptr<windows_process> current_process(vcpu& cpu);
+	[[nodiscard]] std::shared_ptr<windows_process> find_process_by_object(addr_t object);
 	win_obj_manager objs;
 	win_pool pool;
 	win_registry reg;
@@ -70,7 +72,8 @@ struct win_kernel_state : kernel_state
 		const std::function<void()>& validate);
 	NTSTATUS create_ob_handle(vcpu& cpu, addr_t object, std::uint32_t access,
 		std::uint32_t attributes, emu_object<std::uint64_t> output,
-		std::uint32_t operation = 1, std::uint32_t access_ceiling = 0xffffffff);
+		std::uint32_t operation = 1, std::uint32_t access_ceiling = 0xffffffff,
+		const std::function<bool(std::uint64_t)>& write_output = {});
 	bool in_lifecycle_callback(std::size_t cpu) const
 	{ return process_notify.in_callback(cpu) || thread_notify.in_callback(cpu) || image_notify.in_callback(cpu) || registry_notify.in_callback(cpu) || ob_notify.in_callback(cpu); }
 	NTSTATUS call_registry_notify(vcpu& cpu, const win::registry_notify_service::record& registration,
@@ -892,7 +895,7 @@ public:
 		// Driver code lives in supervisor pages, so the dispatch runs in kernel mode and the
 		// caller's thread goes back to user mode after it.
 		set_kernel_mode(cpu, true);
-		kernel_.calls.call(cpu, routine, { { req.device_object, irp } });
+		win::call_with_attachment_checkpoint(kernel_.calls, cpu, routine, { { req.device_object, irp } });
 		set_kernel_mode(cpu, false);
 
 		const emu_object<_IRP> done(space, irp);

@@ -5,6 +5,8 @@
 #include "../status.hpp"
 #include "../string.hpp"
 #include "../thread.hpp"
+#include "../process_memory.hpp"
+#include "../execution_mode.hpp"
 #include "../../thread_scheduler.hpp"
 #include "../types.hpp"
 #include "../../../emu/calling_conv.hpp"
@@ -316,6 +318,44 @@ void modules::register_ntoskrnl_task_ops(win_kernel_state& state, proc_module& m
 
         const auto attributes = object_attributes ? object_attributes.field(&_OBJECT_ATTRIBUTES::Attributes).read() : 0;
         return st->create_ob_handle(cpu, ethread, desired_access, attributes, thread_handle);
+	};
+
+	// Bounded PID form: named process opens and thread-qualified CIDs are not modeled.
+	auto open_process = [st](vcpu& cpu, emu_object<std::uint64_t> process_handle,
+		const std::uint32_t desired_access, emu_object<_OBJECT_ATTRIBUTES> object_attributes,
+		emu_object<_CLIENT_ID> client_id, const bool zw) -> NTSTATUS
+	{
+		if (!process_handle || !object_attributes || !client_id) return STATUS_INVALID_PARAMETER;
+		if (st->ob_notify.in_callback(cpu.id())) st->fail_ob_notify(cpu, "nested handle operations are unsupported");
+		const auto caller = st->current_process(cpu);
+		const auto thread = std::dynamic_pointer_cast<win_thread>(cpu.thread());
+		if (!thread || !thread->ethread()) return STATUS_INVALID_PARAMETER;
+		const auto previous_mode = thread->ethread().field(&_ETHREAD::Tcb).field(&_KTHREAD::PreviousMode).read();
+		if (previous_mode != 0 && previous_mode != 1) return STATUS_INVALID_PARAMETER;
+		const bool user = win::executing_user_mode(cpu) || (!zw && previous_mode != 0);
+		auto& space = *cpu.curr_addr_space();
+		_OBJECT_ATTRIBUTES attributes{};
+		_CLIENT_ID cid{};
+		if (!process_memory_copy::capture(caller, space, object_attributes.address(), &attributes,
+				sizeof(attributes), false, user)
+			|| !process_memory_copy::capture(caller, space, client_id.address(), &cid, sizeof(cid), false, user)
+			|| !process_memory_copy::capture(caller, space, process_handle.address(), nullptr,
+				sizeof(std::uint64_t), true, user)) return STATUS_ACCESS_VIOLATION;
+		if (attributes.Length != sizeof(attributes)) return STATUS_INVALID_PARAMETER;
+		if (attributes.ObjectName || attributes.RootDirectory || cid.UniqueThread) return STATUS_INVALID_PARAMETER;
+		if (attributes.SecurityDescriptor || attributes.SecurityQualityOfService
+			|| (attributes.Attributes & ~0x242u)) return STATUS_NOT_SUPPORTED;
+		if (user && (attributes.Attributes & 0x200u)) return STATUS_INVALID_PARAMETER;
+		const auto pid = guest_va(cid.UniqueProcess);
+		if (!pid || pid > std::numeric_limits<process::id_type>::max()) return STATUS_INVALID_CID;
+		const auto process = std::dynamic_pointer_cast<windows_process>(st->find_process(static_cast<process::id_type>(pid)));
+		if (!process || !st->find_process_by_object(process->eprocess().address())) return STATUS_INVALID_CID;
+		const auto original_space = cpu.curr_addr_space();
+		return st->create_ob_handle(cpu, process->eprocess().address(), desired_access,
+			attributes.Attributes, process_handle, 1, 0xffffffff,
+			[caller, original_space, address = process_handle.address(), user](std::uint64_t handle) {
+				return process_memory_copy::store_handle(caller, *original_space, address, handle, user);
+			});
 	};
 
 	auto terminate_thread = [st](vcpu& cpu, const std::uint64_t thread_handle,
@@ -934,6 +974,17 @@ void modules::register_ntoskrnl_task_ops(win_kernel_state& state, proc_module& m
 
 	state.redirect_ntzw(mod, "CreateThreadEx", create_thread);
 	state.redirect_ntzw(mod, "OpenThread", open_thread);
+	state.redirect(mod, "NtOpenProcess",
+		[open_process](vcpu& cpu, emu_object<std::uint64_t> handle, std::uint32_t access,
+			emu_object<_OBJECT_ATTRIBUTES> attributes, emu_object<_CLIENT_ID> client) -> NTSTATUS
+		{ return open_process(cpu, handle, access, attributes, client, false); });
+	// Only a distinct kernel Zw entry overrides PreviousMode. Native user calls
+	// remain UserMode even if they enter through a Zw alias.
+	if (const auto symbol = mod.find_symbol("ZwOpenProcess"); symbol && symbol != mod.find_symbol("NtOpenProcess"))
+		state.redirect(mod, "ZwOpenProcess",
+			[open_process](vcpu& cpu, emu_object<std::uint64_t> handle, std::uint32_t access,
+				emu_object<_OBJECT_ATTRIBUTES> attributes, emu_object<_CLIENT_ID> client) -> NTSTATUS
+			{ return open_process(cpu, handle, access, attributes, client, true); });
 	state.redirect_ntzw(mod, "TerminateThread", terminate_thread);
 	state.redirect_ntzw(mod, "DelayExecution", delay_execution);
 	state.redirect_ntzw(mod, "QueryInformationThread", query_thread);

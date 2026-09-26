@@ -22,6 +22,25 @@ public:
 				stack_base + stack_size - process::stack_reserve, cpu),
 			stack_low_(stack_base), stack_size_(stack_size) {}
 
+	~win_thread() override;
+
+	struct attachment_frame
+	{
+		addr_t state_address;
+		std::shared_ptr<windows_process> target, previous;
+		std::shared_ptr<addr_space> target_space, previous_space;
+		_KAPC_STATE saved;
+	};
+	[[nodiscard]] std::shared_ptr<windows_process> effective_process() const;
+	[[nodiscard]] std::shared_ptr<addr_space> execution_addr_space() const override;
+	[[nodiscard]] std::size_t attachment_depth() const { return attachments_.size(); }
+	void attach(vcpu& cpu, std::shared_ptr<windows_process> target, addr_t state);
+	void detach(vcpu& cpu, addr_t state);
+	void rollback_attachments(vcpu& cpu, std::size_t depth);
+	// Callback scopes cannot consume attachments owned by their caller.
+	void push_attachment_floor() { attachment_floors_.push_back(attachments_.size()); }
+	void pop_attachment_floor() { attachment_floors_.pop_back(); }
+
 	void save(vcpu& cpu) override;
 	void restore(vcpu& cpu) const override;
 
@@ -107,6 +126,8 @@ public:
 	[[nodiscard]] bool is_user_mode() const override { return !is_system_thread(); }
 
 protected:
+	std::vector<attachment_frame> attachments_;
+	std::vector<std::size_t> attachment_floors_;
 	mutable std::recursive_mutex wait_mutex_;
 	std::uint64_t wait_now(bool monotonic) const;
 	std::optional<wait_state> wait_;
@@ -141,3 +162,28 @@ class win_kernel_thread : public win_thread
 public:
 	using win_thread::win_thread;
 };
+
+// The guest register snapshot deliberately does not own attachment bookkeeping.
+class win_attachment_checkpoint
+{
+public:
+	win_attachment_checkpoint(win_thread& t, vcpu& cpu)
+		: thread_(t), cpu_(cpu), depth_(t.attachment_depth()), space_(cpu.curr_addr_space())
+	{ thread_.push_attachment_floor(); }
+	~win_attachment_checkpoint();
+	void validate() const;
+private:
+	win_thread& thread_;
+	vcpu& cpu_;
+	std::size_t depth_;
+	std::shared_ptr<addr_space> space_;
+};
+
+class guest_caller;
+namespace win {
+// Every Windows host-to-guest callback must return to the caller's attachment
+// stack as well as its saved registers/address space.
+std::uint64_t call_with_attachment_checkpoint(guest_caller& calls, vcpu& cpu,
+	addr_t routine, std::span<const std::uint64_t> args, std::size_t scratch = 0,
+	const std::function<bool()>& cancelled = {});
+}

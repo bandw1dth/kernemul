@@ -490,7 +490,7 @@ void modules::register_ntoskrnl_misc_ops(win_kernel_state& state, proc_module& m
 
 				try
 				{
-					st->calls.call(cpu, registration->function, args, 0, [&]
+					win::call_with_attachment_checkpoint(st->calls, cpu, registration->function, args, 0, [&]
 					{
 						// Nested guest calls cannot yet suspend and resume their host continuation.
 						// Check deadlines as well as wait state so even a sleep that has already
@@ -998,7 +998,7 @@ void modules::register_ntoskrnl_misc_ops(win_kernel_state& state, proc_module& m
 				if (const auto* const target = own ? st->per_cpu(id) : nullptr)
 					emulator->set_pcr(cpu, target->address());
 
-				const auto value = st->calls.call(cpu, broadcast_function, args);
+				const auto value = win::call_with_attachment_checkpoint(st->calls, cpu, broadcast_function, args);
 
 				// The caller is given what the worker returned on the cpu it called from.
 				if (id == self)

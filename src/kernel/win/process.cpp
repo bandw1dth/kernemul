@@ -57,6 +57,7 @@ void win_kernel_state::call_ob_notify(vcpu& cpu, addr_t routine, addr_t context,
     const auto scheduler = sys_proc->scheduler();
     if (!caller || !caller->ethread() || !emu || cpu.in_dpc || emu->irql(cpu) != passive_level)
         fail_ob_notify(cpu, "callback requires a thread at PASSIVE_LEVEL");
+    win_attachment_checkpoint attachments(*caller, cpu);
     const auto irql = emu->irql(cpu);
     const auto kernel = caller->kernel_apc_disable().read();
     const auto special = caller->special_apc_disable().read();
@@ -106,6 +107,7 @@ void win_kernel_state::call_ob_notify(vcpu& cpu, addr_t routine, addr_t context,
             || (scheduler && scheduler->stopped())) fail_ob_notify(cpu, "callback execution failed");
         if (caller->suspend_count() || caller->is_waiting() || caller->sleep_until() != sleep)
             fail_ob_notify(cpu, "callback cannot block or suspend");
+        attachments.validate();
         if (emu->irql(cpu) != passive_level || caller->kernel_apc_disable().read() != -1
             || caller->special_apc_disable().read() != 0)
             fail_ob_notify(cpu, "callback returned with unbalanced IRQL/APC context");
@@ -135,6 +137,7 @@ void win_kernel_state::call_lifecycle(vcpu& cpu, addr_t routine,
     const auto scheduler = sys_proc->scheduler();
     if (!caller || !caller->ethread() || !emu || cpu.in_dpc || emu->irql(cpu) > (context == 0 ? apc_level : passive_level))
         fail_thread_notify(cpu, "callback requires a thread at PASSIVE_LEVEL");
+    win_attachment_checkpoint attachments(*caller, cpu);
     const auto irql = emu->irql(cpu);
     const auto kernel = caller->kernel_apc_disable().read();
     const auto special = caller->special_apc_disable().read();
@@ -189,6 +192,7 @@ void win_kernel_state::call_lifecycle(vcpu& cpu, addr_t routine,
             || (scheduler && scheduler->stopped())) fail_thread_notify(cpu, "callback execution failed");
         if (caller->suspend_count() || caller->is_waiting() || caller->sleep_until() != sleep)
             fail_thread_notify(cpu, context == 0 ? "blocking guest callbacks are unsupported" : "callback cannot block or suspend");
+        attachments.validate();
         if (emu->irql(cpu) != irql || caller->kernel_apc_disable().read() != delivery_kernel
             || caller->special_apc_disable().read() != delivery_special)
             fail_thread_notify(cpu, "callback returned with unbalanced IRQL/APC context");
@@ -211,7 +215,8 @@ void win_kernel_state::call_lifecycle(vcpu& cpu, addr_t routine,
 
 NTSTATUS win_kernel_state::create_ob_handle(vcpu& cpu, addr_t object, std::uint32_t access,
     std::uint32_t attributes, emu_object<std::uint64_t> output,
-    std::uint32_t operation, std::uint32_t access_ceiling)
+    std::uint32_t operation, std::uint32_t access_ceiling,
+    const std::function<bool(std::uint64_t)>& write_output)
 {
     if (ob_notify.in_callback(cpu.id())) fail_ob_notify(cpu, "nested handle operations are unsupported");
     if (!output) return STATUS_INVALID_PARAMETER;
@@ -232,7 +237,18 @@ NTSTATUS win_kernel_state::create_ob_handle(vcpu& cpu, addr_t object, std::uint3
         {
             handle = handles.create_handle(object, access, attributes);
             if (!handle) return STATUS_INSUFFICIENT_RESOURCES;
-            output.write(handle);
+            // A caller with checked user output publishes under its VM metadata
+            // lock here, after pre callbacks and without holding it across guest code.
+            if (write_output)
+            {
+                if (!write_output(handle))
+                {
+                    handles.close_handle(handle);
+                    handle = 0;
+                    return STATUS_ACCESS_VIOLATION;
+                }
+            }
+            else output.write(handle);
             return STATUS_SUCCESS;
         }
         catch (...) { if (handle) handles.close_handle(handle); handle = 0; return STATUS_ACCESS_VIOLATION; }
@@ -307,6 +323,7 @@ NTSTATUS win_kernel_state::call_registry_notify(vcpu& cpu,
 	};
 	if (!caller || !caller->ethread() || !emu || cpu.in_dpc || emu->irql(cpu) != passive_level)
 		fail("callback requires a thread at PASSIVE_LEVEL");
+	win_attachment_checkpoint attachments(*caller, cpu);
 	const auto irql = emu->irql(cpu);
 	const auto kernel = caller->kernel_apc_disable().read();
 	const auto special = caller->special_apc_disable().read();
@@ -350,6 +367,7 @@ NTSTATUS win_kernel_state::call_registry_notify(vcpu& cpu,
 			|| (scheduler && scheduler->stopped())) fail("callback execution failed");
 		if (caller->suspend_count() || caller->is_waiting() || caller->sleep_until() != sleep)
 			fail("callback cannot block or suspend");
+		attachments.validate();
 		if (emu->irql(cpu) != irql || caller->kernel_apc_disable().read() != kernel
 			|| caller->special_apc_disable().read() != special)
 			fail("callback returned with unbalanced IRQL/APC context");
@@ -684,6 +702,7 @@ void win_kernel_state::finish_thread(vcpu& cpu, const NTSTATUS status)
 {
 	const auto t = std::dynamic_pointer_cast<win_thread>(cpu.thread());
 	if (!t) return;
+	if (t->attachment_depth()) fail_thread_notify(cpu, "process attach: thread cannot terminate while attached");
 	if (in_lifecycle_callback(cpu.id()))
 		fail_thread_notify(cpu, "a thread cannot terminate inside a lifecycle callback");
 	const auto proc = std::dynamic_pointer_cast<windows_process>(t->proc());
@@ -764,7 +783,9 @@ std::shared_ptr<thread> windows_process::create_suspended_thread(vcpu& cpu,
 	const auto id = static_cast<thread_id_type>(objs_.allocate_id());
 	const auto size = thread_stack_size(stack_size);
 
-	const addr_t stack_base = addr_space_->alloc(size, prot_rw | prot_supervisor);
+	// Kernel stacks must use the shared kernel allocator, whose cursor owns this half.
+	const auto kernel_space = emulator_ ? emulator_->emu().default_addr_space() : addr_space_;
+	const addr_t stack_base = kernel_space->alloc(size, prot_rw | prot_supervisor);
 	if (!stack_base) return {};
 	auto self = std::static_pointer_cast<windows_process>(shared_from_this());
 	auto t = std::make_shared<win_kernel_thread>(
@@ -853,6 +874,12 @@ void windows_process::setup_ethread(const std::shared_ptr<win_thread>& t, const 
 
 	t->set_ethread(obj);
 	if (!obj) return;
+	const auto apc = obj.field(&_ETHREAD::Tcb).field(&_KTHREAD::ApcState);
+	for (std::size_t i = 0; i < 2; ++i)
+	{
+		const auto head = apc.address() + offsetof(_KAPC_STATE, ApcListHead) + i * sizeof(_LIST_ENTRY);
+		apc.field(&_KAPC_STATE::ApcListHead).write(guest_links(head, head), i);
+	}
 
 	if (!eprocess_)
 		return;
@@ -902,7 +929,14 @@ void windows_process::terminate_thread(const thread_id_type id)
 {
 	// Nothing frees the ETHREAD, so it is only unlinked.
 	if (const auto t = std::dynamic_pointer_cast<win_thread>(find_thread(id)))
+	{
+		if (t->attachment_depth())
+		{
+			if (scheduler()) scheduler()->stop();
+			throw std::runtime_error("process attach: thread cannot terminate while attached");
+		}
 		destroy_ethread(*t);
+	}
 
 	process::terminate_thread(id);
 }
@@ -1042,4 +1076,26 @@ void windows_process::wake_waiters(struct addr_space& space, const addr_t object
 		if (const auto s = scheduler())
 			s->wake();
 	}
+}
+
+std::shared_ptr<windows_process> win_kernel_state::current_process(vcpu& cpu)
+{
+	const auto t = std::dynamic_pointer_cast<win_thread>(cpu.thread());
+	return t ? t->effective_process() : sys_proc;
+}
+
+std::shared_ptr<windows_process> win_kernel_state::find_process_by_object(const addr_t object)
+{
+	if (!object || !objs.get_object<process_identity_object>(object)) return {};
+	std::shared_lock lock(proc_mtx_);
+	for (const auto& [id, p] : processes)
+	{
+		const auto proc = std::dynamic_pointer_cast<windows_process>(p);
+		if (!proc || proc->eprocess().address() != object) continue;
+		const auto life = proc->lifecycle.load();
+		if (life == process_lifecycle::exiting || life == process_lifecycle::exited
+			|| life == process_lifecycle::rejected) return {};
+		return proc;
+	}
+	return {};
 }

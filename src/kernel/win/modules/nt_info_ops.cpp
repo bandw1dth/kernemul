@@ -137,8 +137,7 @@ void modules::register_ntoskrnl_info_ops(win_kernel_state& state, proc_module& m
 
 	state.redirect(mod, "PsGetCurrentProcess", [st](vcpu& cpu) -> addr_t
 	{
-		const auto t = cpu.thread();
-		auto proc = t ? std::dynamic_pointer_cast<windows_process>(t->proc()) : nullptr;
+		auto proc = st->current_process(cpu);
 
 		if (!proc)
 			proc = st->sys_proc;
@@ -156,8 +155,7 @@ void modules::register_ntoskrnl_info_ops(win_kernel_state& state, proc_module& m
 	// The same pointer under the name the io manager exports it as.
 	state.redirect(mod, "IoGetCurrentProcess", [st](vcpu& cpu) -> addr_t
 	{
-		const auto t = cpu.thread();
-		auto proc = t ? std::dynamic_pointer_cast<windows_process>(t->proc()) : nullptr;
+		auto proc = st->current_process(cpu);
 
 		if (!proc)
 			proc = st->sys_proc;

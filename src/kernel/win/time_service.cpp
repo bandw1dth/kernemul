@@ -119,7 +119,7 @@ void win_kernel_state::dispatch_dpcs(vcpu& cpu, bool flush)
 				const std::array<std::uint64_t, 4> args{item.address, item.context, item.arg1, item.arg2};
 				THREAD_LOG_INFO("DPC begin: dpc=0x{:X} routine=0x{:X} cpu={} irql={} previous_irql={}",
 					item.address, item.routine, cpu.id(), emulator_->irql(cpu), old_irql);
-				calls.call(cpu, item.routine, args, 0, [&] {
+				win::call_with_attachment_checkpoint(calls, cpu, item.routine, args, 0, [&] {
 					return cpu.dpc_failed || sys_proc->scheduler()->stopped() ||
 						(borrowed && (borrowed->is_finished() || (!was_waiting && borrowed->is_waiting())));
 				});

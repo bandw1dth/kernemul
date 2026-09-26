@@ -43,6 +43,8 @@ public:
 
 	virtual ~thread() = default;
 
+	[[nodiscard]] virtual std::shared_ptr<addr_space> execution_addr_space() const { return proc()->addr_space(); }
+
 	virtual void save(vcpu& cpu)
 	{
 		const auto a = cpu.arch();
@@ -425,7 +427,7 @@ private:
 	// Page tables are not part of the context, so the cpu follows the thread.
 	static void resume(vcpu& cpu, const thread& t)
 	{
-		if (const auto space = t.proc()->addr_space(); cpu.curr_addr_space() != space)
+		if (const auto space = t.execution_addr_space(); cpu.curr_addr_space() != space)
 			cpu.emu()->mem()->switch_to(cpu, space);
 
 		t.restore(cpu);

@@ -28,6 +28,7 @@ public:
 		std::size_t scratch = 0, const std::function<bool()>& cancelled = {})
 	{
 		checked_guest_calls::scope checked(cpu.checked_calls, static_cast<bool>(cancelled));
+		const auto saved_space = cpu.curr_addr_space();
 		const auto a = cpu.arch();
 		const auto regs = a->regs();
 		const auto& conv = *cpu.emu()->call_conv();
@@ -66,12 +67,14 @@ public:
 		catch (...)
 		{
 			cpu.checked_calls.fail();
+			cpu.emu()->mem()->switch_to(cpu, saved_space);
 			for (std::size_t i = 0; i < regs.size(); ++i)
 				cpu.reg_write(regs[i], &saved[i], a->reg_size(regs[i]));
 			throw;
 		}
 
 		const auto result = conv.read_ret(cpu);
+		cpu.emu()->mem()->switch_to(cpu, saved_space);
 
 		for (std::size_t i = 0; i < regs.size(); ++i)
 			cpu.reg_write(regs[i], &saved[i], a->reg_size(regs[i]));
@@ -94,7 +97,8 @@ private:
 	{
 		std::call_once(once_, [&]
 		{
-			trampoline_ = cpu.curr_addr_space()->alloc(0x1000, prot_rx | prot_supervisor);
+			// The trampoline is shared kernel state, even when first called while attached.
+			trampoline_ = cpu.emu()->default_addr_space()->alloc(0x1000, prot_rx | prot_supervisor);
 
 			cpu.emu()->hook_code(trampoline_, trampoline_,
 				[this](vcpu& c, addr_t, std::size_t) {

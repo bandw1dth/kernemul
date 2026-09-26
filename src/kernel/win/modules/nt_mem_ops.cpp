@@ -136,7 +136,7 @@ void modules::register_ntoskrnl_mem_ops(win_kernel_state& state, proc_module& mo
 	auto map_io_space = [](vcpu& cpu, const std::uint64_t physical_address,
 		const std::uint64_t number_of_bytes, const std::string_view who) -> addr_t
 	{
-		auto& space = *cpu.curr_addr_space();
+		auto& space = *cpu.emu()->default_addr_space();
 
 		const auto base = mdl_page_base(physical_address);
 		const auto offset = mdl_page_offset(physical_address);
@@ -180,7 +180,7 @@ void modules::register_ntoskrnl_mem_ops(win_kernel_state& state, proc_module& mo
 	state.redirect(mod, "MmUnmapIoSpace",
 		[](vcpu& cpu, const addr_t base_address, const std::uint64_t number_of_bytes)
 		{
-			auto& space = *cpu.curr_addr_space();
+			auto& space = *cpu.emu()->default_addr_space();
 
 			THREAD_LOG_INFO("MmUnmapIoSpace(0x{:X}, {} bytes)", base_address, number_of_bytes);
 
@@ -617,7 +617,7 @@ void modules::register_ntoskrnl_mem_ops(win_kernel_state& state, proc_module& mo
 			if (!size)
 				return STATUS_INVALID_PARAMETER;
 
-			auto& space = *cpu.curr_addr_space();
+			auto& space = st->kernel_space();
 			const auto base = space.alloc(size, prot_rw | prot_supervisor);
 
 			if (!base)
@@ -651,7 +651,7 @@ void modules::register_ntoskrnl_mem_ops(win_kernel_state& state, proc_module& mo
 		[st](vcpu& cpu, const addr_t mapped_base) -> NTSTATUS
 		{
 			const bool removed = st->system_views.remove(0, mapped_base, [&](const auto size) {
-				auto& space = *cpu.curr_addr_space();
+				auto& space = st->kernel_space();
 				space.mmu_->unmap_virt(space, mapped_base, size);
 				THREAD_LOG_INFO("MmUnmapViewInSystemSpace(0x{:X}): {} bytes", mapped_base, size);
 				return true;

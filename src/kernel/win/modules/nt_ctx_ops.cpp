@@ -214,7 +214,7 @@ void modules::register_ntoskrnl_ctx_ops(win_kernel_state& state, proc_module& mo
 
 					THREAD_LOG_INFO("__C_specific_handler: running __finally at 0x{:X}", handler);
 
-					st->calls.call(cpu, handler, args);
+					win::call_with_attachment_checkpoint(st->calls, cpu, handler, args);
 				}
 
 				return win::exception_continue_search;

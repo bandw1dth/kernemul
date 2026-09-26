@@ -1,4 +1,5 @@
 #include "exception.hpp"
+#include "execution_mode.hpp"
 #include "win_kernel.hpp"
 #include "unwind/unwind.hpp"
 #include "../process.hpp"
@@ -30,7 +31,7 @@ bool win_exception::handle_page_fault(vcpu& cpu)
 	if (!t)
 		return false;
 
-	auto* const proc = dynamic_cast<win_user_proc*>(t->proc().get());
+	auto* const proc = dynamic_cast<win_user_proc*>(kernel_.current_process(cpu).get());
 
 	if (!proc)
 		return false;
@@ -52,8 +53,8 @@ bool win_exception::handle(vcpu& cpu, const cpu_exception ex)
 			return true;
 	}
 
-	const auto t = cpu.thread();
-	const auto faulting = t ? std::dynamic_pointer_cast<windows_process>(t->proc()) : nullptr;
+	const bool user_mode = win::executing_user_mode(cpu);
+	const auto faulting = user_mode ? kernel_.current_process(cpu) : kernel_.sys_proc;
 	auto& proc = faulting ? *faulting : *kernel_.sys_proc;
 
 	const auto original_pc = cpu.pc();
@@ -70,7 +71,7 @@ bool win_exception::handle(vcpu& cpu, const cpu_exception ex)
 	info.fault_address = cpu.arch()->fault_addr(cpu);
 
 	// There is no loader under a driver to own a dispatcher, so the walk below stays here.
-	if (dynamic_cast<win_user_proc*>(&proc))
+	if (user_mode && dynamic_cast<win_user_proc*>(&proc))
 	{
 		std::optional<addr_t> dispatcher;
 
@@ -171,7 +172,7 @@ bool win_exception::handle(vcpu& cpu, const cpu_exception ex)
 			result.establisher_frame);
 
 		const auto disposition = static_cast<std::int32_t>(
-			kernel_.calls.call(cpu, result.handler, args, frame.scratch));
+			win::call_with_attachment_checkpoint(kernel_.calls, cpu, result.handler, args, frame.scratch));
 
 		const auto answered = space.read_mem<dispatcher_context64>(frame.dispatcher);
 

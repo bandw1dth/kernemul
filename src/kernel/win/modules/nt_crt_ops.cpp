@@ -416,7 +416,7 @@ void modules::register_ntoskrnl_crt_ops(win_kernel_state& state, proc_module& mo
 
 				const std::uint64_t args[] = { key, at };
 				const auto order = static_cast<std::int32_t>(
-					st->calls.call(cpu, comparator, args));
+					win::call_with_attachment_checkpoint(st->calls, cpu, comparator, args));
 
 				if (order == 0)
 				{
@@ -462,7 +462,7 @@ void modules::register_ntoskrnl_crt_ops(win_kernel_state& state, proc_module& mo
 					const std::uint64_t args[] = { base + a * width, base + b * width };
 
 					return static_cast<std::int32_t>(
-						st->calls.call(cpu, comparator, args)) < 0;
+						win::call_with_attachment_checkpoint(st->calls, cpu, comparator, args)) < 0;
 				});
 
 			std::vector<std::uint8_t> sorted(elements.size());

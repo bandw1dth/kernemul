@@ -6,6 +6,8 @@
 #include "../string.hpp"
 #include "../types.hpp"
 #include "../section_image.hpp"
+#include "../process_memory.hpp"
+#include "../execution_mode.hpp"
 #include "../../../util/log.hpp"
 #include "../../../util/string.hpp"
 #include <algorithm>
@@ -39,8 +41,8 @@ enum page_protection : std::uint32_t
 
 win_user_mem* user_mem(vcpu& cpu)
 {
-	const auto t = cpu.thread();
-	auto* const proc = t ? dynamic_cast<win_user_proc*>(t->proc().get()) : nullptr;
+	const auto t = std::dynamic_pointer_cast<win_thread>(cpu.thread());
+	auto* const proc = t ? dynamic_cast<win_user_proc*>(t->effective_process().get()) : nullptr;
 	return proc ? &proc->mem() : nullptr;
 }
 
@@ -140,7 +142,7 @@ constexpr std::uint64_t current_process_handle = ~std::uint64_t{0};
 
 bool is_current_process(const std::uint64_t handle)
 {
-	return handle == 0 || handle == current_process_handle;
+	return handle == current_process_handle;
 }
 
 }
@@ -149,6 +151,64 @@ bool is_current_process(const std::uint64_t handle)
 void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod)
 {
 	auto* st = &state;
+
+	state.redirect(mod, "MmCopyVirtualMemory",
+		[st](vcpu& cpu, addr_t source_process, addr_t source, addr_t target_process,
+			addr_t target, std::uint64_t size, std::uint8_t mode, addr_t copied) -> NTSTATUS
+		{
+			if (mode > 1) return STATUS_INVALID_PARAMETER;
+			if (!copied) return STATUS_ACCESS_VIOLATION;
+			const auto from = st->find_process_by_object(source_process);
+			const auto to = st->find_process_by_object(target_process);
+			if (!from || !to) return STATUS_INVALID_PARAMETER;
+			return process_memory_copy::copy(cpu, st->current_process(cpu), from, source,
+				to, target, size, mode != 0, copied);
+		});
+
+	auto transfer = [st](vcpu& cpu, std::uint64_t handle, addr_t address, addr_t buffer,
+		std::uint64_t size, addr_t copied, bool write, bool zw) -> NTSTATUS
+	{
+		const auto caller = st->current_process(cpu);
+		const auto thread = std::dynamic_pointer_cast<win_thread>(cpu.thread());
+		if (!thread || !thread->ethread()) return STATUS_INVALID_PARAMETER;
+		const auto previous_mode = thread->ethread().field(&_ETHREAD::Tcb).field(&_KTHREAD::PreviousMode).read();
+		if (previous_mode != 0 && previous_mode != 1) return STATUS_INVALID_PARAMETER;
+		// Native syscalls still execute at user CPL in this emulator. Kernel Nt
+		// callers retain PreviousMode; only a distinct kernel Zw entry overrides it.
+		const bool user = win::executing_user_mode(cpu) || (!zw && previous_mode != 0);
+		std::shared_ptr<windows_process> remote;
+		if (handle == current_process_handle) remote = caller;
+		else
+		{
+			const auto entry = st->sys_proc->handle_table().lookup_handle(handle);
+			if (!entry) return STATUS_INVALID_HANDLE;
+			if (user && (entry->attributes & 0x200u)) return STATUS_INVALID_HANDLE;
+			remote = st->find_process_by_object(entry->body_addr);
+			if (!remote) return STATUS_INVALID_HANDLE;
+			const auto required = write ? 0x20u : 0x10u;
+			if ((entry->access & required) != required) return STATUS_ACCESS_DENIED;
+		}
+		if (!remote || !st->find_process_by_object(remote->eprocess().address())) return STATUS_INVALID_HANDLE;
+		return write
+			? process_memory_copy::copy(cpu, caller, caller, buffer, remote, address, size,
+				user, copied)
+			: process_memory_copy::copy(cpu, caller, remote, address, caller, buffer, size,
+				user, copied);
+	};
+	for (const bool write : {false, true})
+	{
+		const std::string nt = write ? "NtWriteVirtualMemory" : "NtReadVirtualMemory";
+		const std::string zw = write ? "ZwWriteVirtualMemory" : "ZwReadVirtualMemory";
+		state.redirect(mod, nt,
+			[transfer, write](vcpu& cpu, std::uint64_t handle, addr_t address, addr_t buffer,
+				std::uint64_t size, addr_t copied) -> NTSTATUS
+			{ return transfer(cpu, handle, address, buffer, size, copied, write, false); });
+		if (const auto symbol = mod.find_symbol(zw); symbol && symbol != mod.find_symbol(nt))
+			state.redirect(mod, zw,
+				[transfer, write](vcpu& cpu, std::uint64_t handle, addr_t address, addr_t buffer,
+					std::uint64_t size, addr_t copied) -> NTSTATUS
+				{ return transfer(cpu, handle, address, buffer, size, copied, write, true); });
+	}
 
 	auto allocate = [](vcpu& cpu, const std::uint64_t process_handle,
 		emu_object<addr_t> base_address, emu_object<std::uint64_t> region_size,
@@ -270,7 +330,7 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 				return STATUS_INVALID_PARAMETER;
 			// A zero-sized release/decommit still names the reservation at base.
 			// Only NtUnmapViewOfSection may remove a tracked section's backing.
-			if (cpu.thread() && st->views.overlaps(cpu.thread()->proc()->id(), base, size ? size : 1))
+			if (cpu.thread() && st->views.overlaps(st->current_process(cpu)->id(), base, size ? size : 1))
 				return STATUS_UNABLE_TO_FREE_VM;
 		}
 
@@ -345,7 +405,7 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 			return STATUS_INVALID_PARAMETER;
 
 		if ((prot_from_page(new_protect) & prot_exec) && cpu.thread()
-			&& st->views.execution_blocked(cpu.thread()->proc()->id(), base, size))
+			&& st->views.execution_blocked(st->current_process(cpu)->id(), base, size))
 			return STATUS_SECTION_PROTECTION;
 
 		if (auto* const mem = user_mem(cpu))
@@ -446,7 +506,8 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 				return STATUS_INFO_LENGTH_MISMATCH;
 
 			const auto t = cpu.thread();
-			const auto proc = t ? t->proc() : nullptr;
+			const auto wt = std::dynamic_pointer_cast<win_thread>(t);
+			const auto proc = wt ? wt->effective_process() : nullptr;
 			const auto mod = proc ? proc->find_module_by_addr(base_address) : nullptr;
 
 			if (!mod)
@@ -713,7 +774,7 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 				offset = section_offset ? static_cast<std::uint64_t>(section_offset.read()) : 0;
 			}
 			catch (...) { return STATUS_ACCESS_VIOLATION; }
-			const auto owner = cpu.thread()->proc()->id();
+			const auto owner = st->current_process(cpu)->id();
 			const bool no_execute = (host->allocation_attributes & sec_image_no_execute) == sec_image_no_execute;
 
 			if (offset >= host->size)
@@ -837,7 +898,7 @@ void modules::register_ntoskrnl_vm_ops(win_kernel_state& state, proc_module& mod
 
 			if (!cpu.thread()) return STATUS_INVALID_PARAMETER;
 			NTSTATUS status = STATUS_INVALID_PARAMETER;
-			st->views.remove(cpu.thread()->proc()->id(), base_address, [&](const auto size) {
+			st->views.remove(st->current_process(cpu)->id(), base_address, [&](const auto size) {
 				auto& space = *cpu.curr_addr_space();
 				if (auto* mem = user_mem(cpu))
 				{

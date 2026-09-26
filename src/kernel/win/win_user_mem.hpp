@@ -96,6 +96,7 @@ public:
 	bool handle_fault(addr_t fault_addr);
 
 private:
+	friend struct process_memory_copy;
 	struct committed_region
 	{
 		std::size_t size;

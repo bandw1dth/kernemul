@@ -23,8 +23,7 @@ emu_object<_EPROCESS> process_or_current(win_kernel_state& state, vcpu& cpu,
 	if (process)
 		return process;
 
-	const auto t = cpu.thread();
-	auto proc = t ? std::dynamic_pointer_cast<windows_process>(t->proc()) : nullptr;
+	const auto proc = state.current_process(cpu);
 
 	return (proc ? proc : state.sys_proc)->eprocess();
 }
@@ -431,78 +430,19 @@ void modules::register_ntoskrnl_process_ops(win_kernel_state& state, proc_module
 				? STATUS_SUCCESS : STATUS_PROCEDURE_NOT_FOUND;
 		});
 
-	// There is one address space here, so a driver reading the target's memory gets its own.
-	auto apc_state_of = [](vcpu& cpu) -> emu_object<_KAPC_STATE>
-	{
-		const auto t = std::dynamic_pointer_cast<win_thread>(cpu.thread());
-
-		if (!t || !t->ethread())
-			return {};
-
-		return t->ethread().field(&_ETHREAD::Tcb).field(&_KTHREAD::ApcState);
-	};
-
 	state.redirect(mod, "KeStackAttachProcess",
-		[apc_state_of](vcpu& cpu, emu_object<_KPROCESS> process,
-			emu_object<_KAPC_STATE> apc_state)
+		[st](vcpu& cpu, const addr_t process, const addr_t apc_state)
 		{
-			const auto current = apc_state_of(cpu);
-
-			if (!current)
-			{
-				THREAD_LOG_ERR("KeStackAttachProcess: nothing is running, so nothing can attach");
-				return;
-			}
-
-			const auto previous = guest_va(current.field(&_KAPC_STATE::Process).read());
-
-			if (apc_state)
-			{
-				_KAPC_STATE saved{};
-				saved.Process = reinterpret_cast<_KPROCESS*>(
-					static_cast<std::uintptr_t>(previous));
-				apc_state.write(saved);
-
-				const auto head = apc_state.address() + offsetof(_KAPC_STATE, ApcListHead);
-				apc_state.field(&_KAPC_STATE::ApcListHead)
-					.write(guest_links(head, head), 0);
-				apc_state.field(&_KAPC_STATE::ApcListHead)
-					.write(guest_links(head + sizeof(_LIST_ENTRY), head + sizeof(_LIST_ENTRY)), 1);
-			}
-
-			current.field(&_KAPC_STATE::Process).write(guest_ptr<_KPROCESS>(process.address()));
-
-			if (process.address() != previous)
-				THREAD_LOG_WARN("KeStackAttachProcess(0x{:X}): there is one address space here, "
-					"so the attach moves the thread's apc state and nothing else",
-					process.address());
-			else
-				THREAD_LOG_INFO("KeStackAttachProcess(0x{:X}): already in that process",
-					process.address());
+			const auto t = std::dynamic_pointer_cast<win_thread>(cpu.thread());
+			const auto target = st->find_process_by_object(process);
+			if (!t || !target) st->fail_thread_notify(cpu, "process attach: invalid caller or process");
+			t->attach(cpu, target, apc_state);
 		});
-
 	state.redirect(mod, "KeUnstackDetachProcess",
-		[apc_state_of](vcpu& cpu, emu_object<_KAPC_STATE> apc_state)
+		[st](vcpu& cpu, const addr_t apc_state)
 		{
-			const auto current = apc_state_of(cpu);
-
-			if (!current)
-			{
-				THREAD_LOG_ERR("KeUnstackDetachProcess: nothing is running");
-				return;
-			}
-
-			if (!apc_state)
-			{
-				THREAD_LOG_ERR("KeUnstackDetachProcess: null apc state, so there is nothing to "
-					"go back to");
-				return;
-			}
-
-			const auto previous = apc_state.field(&_KAPC_STATE::Process).read();
-
-			current.field(&_KAPC_STATE::Process).write(previous);
-
-			THREAD_LOG_INFO("KeUnstackDetachProcess: back in 0x{:X}", guest_va(previous));
+			const auto t = std::dynamic_pointer_cast<win_thread>(cpu.thread());
+			if (!t) st->fail_thread_notify(cpu, "process attach: detach missing caller");
+			t->detach(cpu, apc_state);
 		});
 }
