@@ -139,6 +139,39 @@ generic executable hash is
 Registry conformance and all four registry failure cases also passed on this
 build (`135449` through `135452` manifests).
 
+### Completed process-aware target capture
+
+`build-conformance/kernel-20260926-135545-142` ran for **210.032 seconds** and
+was stopped at the requested limit (host exit `-1` from that deliberate stop).
+The manifest and `analysis.json` pin the local lab commit `054bff5`, executable,
+driver, user image, kernel, and CI DLL. The user-provided DEBUGCTL compatibility
+patch remains confined to guest memory on the local lab branch. The target driver
+and test executable hashes remained unchanged; no `vgc.exe` service was launched.
+
+- At 13:55:51.989–51.996, VGK's Ex (`vgk+0xF4A0`) and classic (`vgk+0xF3E0`)
+  creation callbacks completed for PID 196, created by PID 4/TID 172. Both
+  retained successful admission status.
+- At 13:55:53.280 the native guest program terminated with `0x1234`, after its
+  ring-3/TEB checks. Ex and classic exit callbacks completed in PID 196/TID 200;
+  the lifecycle then unpublished PID 196 at 13:55:53.284.
+- All four callback BEGIN records have matching END records. There were zero
+  callback failures, faulted hooks, missing runtime exports, or unhandled
+  exceptions; stderr was empty. There were 147 handled exceptions and three
+  known optional IRQL hook-symbol setup diagnostics.
+- All eight CI signed-file calls returned without hook faults. The three-minute
+  timer expired and subsequent reads returned true 19 times.
+
+This validates observable process creation and exit, not every Windows process
+subsystem. Four `KeStackAttachProcess` calls still warned that attachment only
+updates APC state, without switching the address space. Real attach/detach and
+cross-process memory access are a concrete next fidelity priority. CI certificate
+verification, firmware/storage backing, exception routing for genuine faults in
+kernel callbacks owned by user threads, and the other stated limits remain.
+
+The generic branch and final generic executable were restored after the capture;
+the lab patch was not included in the published branch. Independent review found
+no remaining material findings in either the lifecycle change or registry fix.
+
 ## Contract sources
 
 - [Classic registration](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/nf-ntddk-pssetcreateprocessnotifyroutine)
