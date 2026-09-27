@@ -156,7 +156,8 @@ read-only, unmapped, supervisor-address, and overflowing output ranges.
 Full process create/exit publication is covered by existing lifecycle regressions,
 but a simultaneous class-5 process-creation/deletion stress test and preservation
 of a real supervisor-page sentinel are not covered by these focused fixtures.
-No new VGK capture was used as the acceptance test for this pass.
+A subsequent [fifteen-minute VGK capture](vgk-process-snapshots-capture.md)
+exercised 32 successful snapshots without a visible runtime regression.
 
 Independent production and completed-fixture reviews found no material issues.
 The final whitespace/error check passed, and no emulator process remained after
