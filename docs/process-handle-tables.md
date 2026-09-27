@@ -163,7 +163,10 @@ at `build-conformance/handle-tables-rundown-validated-20260927/kernemul.exe`, SH
   thread/image/OB notifications, and IRQL conformance passed. Paired storage,
   firmware, process-notification, and OB user fixtures passed.
 - Four checked-callback/DPC negative cases passed: callback wait, OB API failure,
-  thread-notification API failure, and unsupported DPC API.
+  thread-notification API failure, and unsupported DPC API. These ran on the
+  preceding generic executable, SHA-256
+  `4E12C3CBED44DE74A0B425970AC61D1408466654B10E53A006A6FAB86AB06723`,
+  before the rundown correction; they were not repeated on the final executable.
 - The production x64 allocator test passed serialization, 2,048 concurrent
   allocations, translations/data integrity, and mapping-failure recovery. Removing
   the allocation locks made its negative control fail.
@@ -177,6 +180,53 @@ UserMode-denial checks because those Nt names are not exported by the pinned
 kernel. Other native/kernel-handle rejection paths are covered by the main fixture.
 These results do not establish untested private Windows behavior or ARM64 runtime
 conformance.
+
+## Target capture and final analysis
+
+The completed repeat capture is retained locally at
+`build-conformance/kernel-20260927-121310-132/`. It ran for 210.042 seconds on
+WHP and was deliberately stopped at the time limit (exit -1), rather than
+exiting naturally. The earlier repeat at `kernel-20260927-014952-765` was
+interrupted after approximately 46 seconds and is not completion evidence.
+
+The repeat used generic commit `4008b0c` plus the author-provided, in-memory
+DEBUGCTL compatibility stub on local-only lab commit `6c919b4`. Its frozen
+executable SHA-256 is
+`990DEC649896CE06C0061F1C14A71CA8CB27D4972B528D64F05736461D5C39FD`.
+That stub and the lab branches are excluded from the published generic branch.
+The guest arguments were `vgk.sys process_notify_user.exe`; no `vgc.exe` was
+launched. The driver file remained unchanged, with SHA-256
+`3CB2F36CF9F3B66BF63561D24649422D852229F2C788A7AAA783752DCE4AB39F`
+before and after the run. The pinned guest kernel was 10.0.26100.9444.
+
+- DriverEntry returned STATUS_SUCCESS at 12:13:21.441.
+- There were 249 attaches and 249 matching detaches, four process-notification
+  deliveries, and 245 process-rundown releases with zero unmatched-release
+  diagnostics. The first completed capture before the rundown correction
+  (`kernel-20260927-013133-830`) had 246 unmatched-release diagnostics.
+- The three-minute timer was observed signaled 18 times, first at 12:16:14.517.
+- There were 142 handled exceptions, zero unhandled exceptions, zero API/callback
+  faults, zero executed unimplemented-function diagnostics, and empty stderr.
+  Handled exceptions remain part of the observed behavior; these results do not
+  establish that debugger-sensitive paths reproduce real hardware.
+- The only three error-level lines were the existing optional hook-symbol misses
+  for KeRaiseIrql, KfLowerIrql, and KeRaiseIrqlToSynchLevel.
+- CI produced eight verdicts: two trusted SHA-256 signatures and six digest or
+  algorithm mismatches. Trust used the host chain policy with offline revocation
+  unchecked. BootCurrent and Boot0000 queries succeeded, and the physical-memory
+  resource-map key opened successfully.
+- Storage dispatched three requests to the modeled disk: 0x4D02C returned
+  STATUS_BUFFER_TOO_SMALL, while two 0x2D1400 descriptor requests succeeded.
+  Eight opens for unmodeled PhysicalDrive1 through PhysicalDrive4 remained absent;
+  there were no former "not a device" dispatch failures.
+
+The target now exercises substantially more process attachment activity than the
+pre-pass capture (four attaches), while the rundown correction removes the
+specific reference-pairing failure exposed by the first new capture. This is
+evidence for the bounded handle-table/process-rundown model, not full Windows
+Object Manager equivalence. The retained-storage, allocator, security, blocking
+rundown, process-exit cleanup, and ARM64 limits described above still apply.
+User-mode fidelity and software LBR/BTF modeling remain outside this pass.
 
 ## References
 
