@@ -2,6 +2,7 @@
 #include "../kernel.hpp"
 #include "../../sym/symbol.hpp"
 #include "process.hpp"
+#include "process_snapshot.hpp"
 #include "exception.hpp"
 #include "defs.hpp"
 #include "guest_clock.hpp"
@@ -49,6 +50,7 @@
 struct win_kernel_state : kernel_state
 {
 	[[nodiscard]] std::shared_ptr<windows_process> current_process(vcpu& cpu);
+	[[nodiscard]] std::vector<process_snapshot> snapshot_processes();
 	[[nodiscard]] std::shared_ptr<windows_process> find_process_by_object(addr_t object);
 	std::uint8_t handle_mode(vcpu& cpu);
 	win_handle_table* select_handle_table(vcpu& cpu, std::uint64_t handle,
@@ -660,6 +662,7 @@ private:
 		std::string_view name, addr_t peb_address = 0)
 	{
 		_EPROCESS ep{};
+		ep.Pcb.BasePriority = 8;
 		ep.UniqueProcessId = reinterpret_cast<void*>(static_cast<std::uintptr_t>(id));
 		ep.Peb = reinterpret_cast<_PEB*>(static_cast<std::uintptr_t>(peb_address));
 		std::memcpy(ep.ImageFileName, name.data(), std::min(name.size(), sizeof(ep.ImageFileName)));

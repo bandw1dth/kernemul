@@ -164,6 +164,12 @@ std::optional<win_handle_table::handle_entry> win_handle_table::lookup_handle(ha
     return it->second;
 }
 
+std::size_t win_handle_table::count() const
+{
+    std::shared_lock lock(mtx_);
+    return handles_.size();
+}
+
 std::vector<win_handle_table::snapshot_entry> win_handle_table::snapshot() const
 {
     std::shared_lock lock(mtx_);

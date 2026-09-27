@@ -1,5 +1,6 @@
 #include "process.hpp"
 #include <utility>
+#include <unordered_set>
 #include "thread.hpp"
 #include "win_kernel.hpp"
 #include "../thread_scheduler.hpp"
@@ -1092,6 +1093,54 @@ void windows_process::wake_waiters(struct addr_space& space, const addr_t object
 		if (const auto s = scheduler())
 			s->wake();
 	}
+}
+
+std::vector<process_snapshot> win_kernel_state::snapshot_processes()
+{
+	std::vector<process_snapshot> result;
+	// Publication takes proc_mtx_; setup/destroy take list_mtx_. Never call
+	// find_process here, or acquire proc_mtx_ while holding list_mtx_.
+	std::shared_lock processes_lock(proc_mtx_);
+	std::scoped_lock lists_lock(list_mtx_);
+	if (!active_process_list.address()) return result;
+	std::unordered_set<addr_t> seen_processes;
+	active_process_list.for_each([&](emu_object<_EPROCESS> object)
+	{
+		if (seen_processes.size() >= std::numeric_limits<std::uint32_t>::max() / 0x100u)
+			throw std::length_error("process snapshot size overflow");
+		if (!seen_processes.insert(object.address()).second)
+			throw std::runtime_error("cyclic active process list");
+		const auto ep = object.read();
+		const auto pid = guest_va(ep.UniqueProcessId);
+		const auto found = processes.find(static_cast<process::id_type>(pid));
+		if (found == processes.end()) return true;
+		const auto proc = std::dynamic_pointer_cast<windows_process>(found->second);
+		if (!proc || proc->id() != pid || proc->eprocess().address() != object.address()) return true;
+		const auto handles = proc->handle_table().count();
+		if (handles > std::numeric_limits<std::uint32_t>::max())
+			throw std::length_error("process handle count overflow");
+		const auto* image = reinterpret_cast<const char*>(ep.ImageFileName);
+		process_snapshot record{pid, ep.CreateTime.QuadPart, guest_va(ep.InheritedFromUniqueProcessId),
+			std::string(image, ::strnlen(image, sizeof(ep.ImageFileName))),
+			ep.Pcb.BasePriority, static_cast<std::uint32_t>(handles), {}};
+		std::unordered_set<addr_t> seen_threads;
+		eprocess_thread_list(*object.space(), object.address()).for_each([&](emu_object<_ETHREAD> thread)
+		{
+			if (!seen_threads.insert(thread.address()).second)
+				throw std::runtime_error("cyclic process thread list");
+			if (record.threads.size() >= (std::numeric_limits<std::uint32_t>::max() - 0x100u) / 0x50u)
+				throw std::length_error("process thread count overflow");
+			// Membership is stable here; scheduler fields can change independently.
+			const auto et = thread.read();
+			record.threads.push_back({guest_va(et.Cid.UniqueProcess), guest_va(et.Cid.UniqueThread),
+				guest_va(et.StartAddress), et.CreateTime.QuadPart, et.Tcb.Priority, et.Tcb.BasePriority,
+				et.Tcb.ContextSwitches, et.Tcb.State, et.Tcb.WaitReason});
+			return true;
+		});
+		result.push_back(std::move(record));
+		return true;
+	});
+	return result;
 }
 
 std::shared_ptr<windows_process> win_kernel_state::current_process(vcpu& cpu)

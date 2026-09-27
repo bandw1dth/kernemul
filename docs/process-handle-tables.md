@@ -228,6 +228,10 @@ Object Manager equivalence. The retained-storage, allocator, security, blocking
 rundown, process-exit cleanup, and ARM64 limits described above still apply.
 User-mode fidelity and software LBR/BTF modeling remain outside this pass.
 
+The subsequent [fifteen-minute kernel capture](vgk-kernel-15-minute-analysis.md)
+records longer post-expiry behavior, allocation trends, observability limits,
+and the recommended process/thread snapshot coherence pass.
+
 ## References
 
 - [Microsoft: object handles](https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/object-handles)

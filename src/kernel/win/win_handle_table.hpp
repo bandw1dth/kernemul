@@ -31,6 +31,7 @@ public:
 	void initialize_guest(addr_space& space, addr_t eprocess, std::uint32_t pid);
 	[[nodiscard]] addr_t guest_address() const;
 	[[nodiscard]] std::vector<snapshot_entry> snapshot() const;
+	[[nodiscard]] std::size_t count() const;
 	// Bounded host references protect lookup bookkeeping, not native blocking
 	// rundown. The kernel registry retains exposed owners/storage after exit.
 	bool reference();

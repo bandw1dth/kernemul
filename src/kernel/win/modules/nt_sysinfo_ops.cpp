@@ -3,6 +3,12 @@
 #include "../objects.hpp"
 #include "../filesystem.hpp"
 #include "../process_params.hpp"
+#include "../process_memory.hpp"
+#if defined(KERNEMUL_ARCH_ARM64)
+#include "../../../emu/arm64/addr_space.hpp"
+#else
+#include "../../../emu/x86/addr_space.hpp"
+#endif
 #include "../status.hpp"
 #include "../types.hpp"
 #include "../../../util/log.hpp"
@@ -12,6 +18,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace
@@ -141,36 +148,47 @@ constexpr std::uint32_t module_ex_entry_size = sizeof(rtl_process_module_informa
 constexpr std::uint32_t module_list_header_size =
 	static_cast<std::uint32_t>(offsetof(rtl_process_modules_t, modules));
 
-// Read out of PsActiveProcessHead rather than the host side process map, so this query and the
-// list a driver walks itself never disagree about what is running.
-struct listed_process_t
+// Host MMU copies ignore access permissions. Check every page before any output
+// write, including supervisor mappings at low addresses. No model lock is held.
+bool process_output_writable(addr_space& space, addr_t address, std::size_t size, bool user)
 {
-	std::uint64_t pid;
-	std::string name;
-};
-
-std::vector<listed_process_t> collect_processes(win_kernel_state& state)
-{
-	std::vector<listed_process_t> out;
-
-	if (!state.active_process_list.address())
-		return out;
-
-	state.active_process_list.for_each([&](emu_object<_EPROCESS> entry)
+	if (!process_memory_copy::valid_range(address, size, user)) return false;
+	for (std::size_t done = 0; done < size;)
 	{
-		const auto ep = entry.read();
-
-		// ImageFileName is a fixed 15 byte field that is only null terminated when it fits.
-		const auto* const image = reinterpret_cast<const char*>(ep.ImageFileName);
-		const auto len = ::strnlen(image, sizeof(ep.ImageFileName));
-
-		out.push_back({ static_cast<std::uint64_t>(
-			reinterpret_cast<std::uintptr_t>(ep.UniqueProcessId)), std::string(image, len) });
-
-		return true;
-	});
-
-	return out;
+		const auto at = address + done;
+#if defined(KERNEMUL_ARCH_ARM64)
+		const auto* native = dynamic_cast<const arm64::addr_space*>(&space);
+		if (!native) return false;
+		auto table = native->ttbr_pa;
+#else
+		const auto* native = dynamic_cast<const x86::addr_space*>(&space);
+		if (!native) return false;
+		auto table = native->pml4_pa;
+#endif
+		for (int level = 3; level >= 0; --level)
+		{
+			const auto entry = space.mmu_->read_phys<std::uint64_t>(
+				table + ((at >> (12 + 9 * level)) & 511) * 8);
+			if (!(entry & 1)) return false;
+#if defined(KERNEMUL_ARCH_ARM64)
+			if (level == 0 || !(entry & arm64::desc_table))
+			{
+				if ((entry & arm64::desc_ap_ro) || (user && !(entry & arm64::desc_ap_el0))) return false;
+				break;
+			}
+			// APTable restrictions, if installed by guest code.
+			if ((entry & (1ull << 62)) || (user && (entry & (1ull << 61)))) return false;
+			table = entry & arm64::desc_addr_mask;
+#else
+			if (!(entry & 2) || (user && !(entry & 4))) return false;
+			if (level == 0 || (level < 3 && (entry & 0x80))) break;
+			table = entry & 0x000ffffffffff000ull;
+#endif
+		}
+		if (!space.mmu_->virt_to_phys(space, at)) return false;
+		done += std::min(size - done, space.mmu_->page_size() - at % space.mmu_->page_size());
+	}
+	return true;
 }
 
 // What the loaded module list holds, flattened once so both classes describe the same modules
@@ -471,81 +489,104 @@ void modules::register_ntoskrnl_sysinfo_ops(win_kernel_state& state, proc_module
 		// at by a UNICODE_STRING whose buffer has to live in the caller's buffer too.
 		case system_process_information:
 		{
-			const auto procs = collect_processes(*st);
-
-			// The name is padded out so the entry after it stays 8 aligned.
-			const auto entry_size_for = [](const listed_process_t& proc)
+			try
 			{
-				const auto name_bytes = proc.name.size() * sizeof(char16_t);
-
-				return static_cast<std::uint32_t>(sizeof(system_process_information_t)
-					+ sizeof(system_thread_information_t) + ((name_bytes + 7) & ~std::size_t{7}));
-			};
-
-			std::uint32_t required = 0;
-
-			for (const auto& proc : procs)
-				required += entry_size_for(proc);
-
-			if (return_length)
-				return_length.write(required);
-
-			if (length < required)
-			{
-				THREAD_LOG_INFO("NtQuerySystemInformation(SystemProcessInformation): buffer 0x{:X}"
-					" < required 0x{:X} for {} process(es)", length, required, procs.size());
-
-				return STATUS_INFO_LENGTH_MISMATCH;
+				const bool user = st->handle_mode(cpu) != 0;
+				// Validate both destinations before changing either. Zero-length output
+				// queries deliberately ignore the output pointer and its alignment.
+				if (return_length && !process_output_writable(space, return_length.address(), sizeof(std::uint32_t), user))
+					return STATUS_ACCESS_VIOLATION;
+				if (user && length && (system_information & 3))
+					return static_cast<NTSTATUS>(0x80000002); // STATUS_DATATYPE_MISALIGNMENT
+				if (!process_output_writable(space, system_information, length, user))
+					return STATUS_ACCESS_VIOLATION;
+				if (user)
+				{
+					const auto caller = st->current_process(cpu);
+					if ((return_length && !process_memory_copy::capture(caller, space,
+						return_length.address(), nullptr, sizeof(std::uint32_t), true, true))
+						|| !process_memory_copy::capture(caller, space, system_information, nullptr, length, true, true))
+						return STATUS_ACCESS_VIOLATION;
+				}
+				const auto procs = st->snapshot_processes();
+				std::vector<std::u16string> names;
+				std::vector<std::uint32_t> sizes;
+				std::uint32_t required = 0;
+				std::uint64_t thread_count = 0, handle_count = 0;
+				constexpr auto limit = std::numeric_limits<std::uint32_t>::max();
+				for (const auto& proc : procs)
+				{
+					auto wide = widen_string(proc.name);
+					if (wide.size() > (std::numeric_limits<std::uint16_t>::max() / sizeof(char16_t)) - 1)
+						return STATUS_INSUFFICIENT_RESOURCES;
+					const auto name_storage = (wide.size() * sizeof(char16_t) + sizeof(char16_t) + 7) & ~std::size_t{7};
+					const auto base = sizeof(system_process_information_t) + name_storage;
+					if (proc.threads.size() > (limit - base) / sizeof(system_thread_information_t))
+						return STATUS_INSUFFICIENT_RESOURCES;
+					const auto size = static_cast<std::uint32_t>(base + proc.threads.size() * sizeof(system_thread_information_t));
+					if (size > limit - required) return STATUS_INSUFFICIENT_RESOURCES;
+					required += size;
+					thread_count += proc.threads.size();
+					handle_count += proc.handle_count;
+					sizes.push_back(size);
+					names.push_back(std::move(wide));
+				}
+				if (length < required)
+				{
+					if (return_length) space.write_mem(return_length.address(), required);
+					THREAD_LOG_INFO("NtQuerySystemInformation(SystemProcessInformation): buffer 0x{:X}"
+						" < required 0x{:X} for {} process(es)", length, required, procs.size());
+					return STATUS_INFO_LENGTH_MISMATCH;
+				}
+				std::vector<std::uint8_t> out(required, 0);
+				std::size_t offset = 0;
+				for (std::size_t i = 0; i < procs.size(); ++i)
+				{
+					const auto& proc = procs[i];
+					const auto name_bytes = names[i].size() * sizeof(char16_t);
+					const auto name_at = offset + sizeof(system_process_information_t)
+						+ proc.threads.size() * sizeof(system_thread_information_t);
+					system_process_information_t entry{};
+					entry.next_entry_offset = i + 1 < procs.size() ? sizes[i] : 0;
+					entry.number_of_threads = static_cast<std::uint32_t>(proc.threads.size());
+					entry.base_priority = proc.base_priority;
+					entry.unique_process_id = proc.process_id;
+					entry.create_time = proc.create_time;
+					entry.inherited_from_unique_process_id = proc.parent_id;
+					entry.handle_count = proc.handle_count;
+					entry.image_name.Length = static_cast<std::uint16_t>(name_bytes);
+					entry.image_name.MaximumLength = static_cast<std::uint16_t>(name_bytes + sizeof(char16_t));
+					entry.image_name.Buffer = guest_ptr<char16_t>(system_information + name_at);
+					std::memcpy(out.data() + offset, &entry, sizeof(entry));
+					std::memcpy(out.data() + name_at, names[i].data(), name_bytes);
+					std::size_t thread_at = offset + sizeof(entry);
+					for (const auto& t : proc.threads)
+					{
+						system_thread_information_t thread{};
+						thread.create_time = t.create_time;
+						thread.start_address = t.start_address;
+						thread.unique_process_id = t.process_id;
+						thread.unique_thread_id = t.thread_id;
+						thread.priority = t.priority;
+						thread.base_priority = t.base_priority;
+						thread.context_switches = t.context_switches;
+						thread.thread_state = t.state;
+						thread.wait_reason = t.wait_reason;
+						std::memcpy(out.data() + thread_at, &thread, sizeof(thread));
+						thread_at += sizeof(thread);
+					}
+					offset += sizes[i];
+				}
+				if (required) space.write_mem(system_information, out.data(), out.size());
+				if (return_length) space.write_mem(return_length.address(), required);
+				THREAD_LOG_INFO("NtQuerySystemInformation(SystemProcessInformation): {} process(es),"
+					" 0x{:X} bytes, {} thread(s), {} handle(s)",
+					procs.size(), required, thread_count, handle_count);
+				return STATUS_SUCCESS;
 			}
-
-			std::vector<std::uint8_t> out(required, 0);
-			std::uint32_t offset = 0;
-
-			for (std::size_t i = 0; i < procs.size(); ++i)
-			{
-				const auto& proc = procs[i];
-				const auto wide = widen_string(proc.name);
-				const auto name_bytes = wide.size() * sizeof(char16_t);
-				const auto entry_size = entry_size_for(proc);
-
-				auto* const entry = reinterpret_cast<system_process_information_t*>(
-					out.data() + offset);
-				auto* const thread = reinterpret_cast<system_thread_information_t*>(
-					out.data() + offset + sizeof(system_process_information_t));
-
-				const auto name_at = offset + static_cast<std::uint32_t>(
-					sizeof(system_process_information_t) + sizeof(system_thread_information_t));
-
-				std::memcpy(out.data() + name_at, wide.data(), name_bytes);
-
-				entry->next_entry_offset = i + 1 < procs.size() ? entry_size : 0;
-				entry->number_of_threads = 1;
-				entry->base_priority = 8;
-				entry->unique_process_id = proc.pid;
-				entry->handle_count = 32;
-				entry->image_name.Length = static_cast<unsigned short>(name_bytes);
-				entry->image_name.MaximumLength =
-					static_cast<unsigned short>(name_bytes + sizeof(char16_t));
-				entry->image_name.Buffer = guest_ptr<char16_t>(system_information + name_at);
-
-				// One thread each: nothing here tracks per process threads, and a process with
-				// none would read as a process that is already gone.
-				thread->unique_process_id = proc.pid;
-				thread->unique_thread_id = proc.pid + 4;
-				thread->priority = 8;
-				thread->base_priority = 8;
-				thread->thread_state = 5;  // Waiting
-				thread->wait_reason = 13;  // WrQueue
-
-				offset += entry_size;
-			}
-
-			space.write_mem(system_information, out.data(), out.size());
-
-			THREAD_LOG_INFO("NtQuerySystemInformation(SystemProcessInformation): {} process(es),"
-				" 0x{:X} bytes", procs.size(), required);
-
-			return STATUS_SUCCESS;
+			catch (const std::bad_alloc&) { return STATUS_INSUFFICIENT_RESOURCES; }
+			catch (const std::length_error&) { return STATUS_INSUFFICIENT_RESOURCES; }
+			catch (const std::exception&) { return STATUS_ACCESS_VIOLATION; }
 		}
 
 		case system_module_information:

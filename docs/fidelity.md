@@ -75,7 +75,10 @@ versions. Do not load the unsigned fixture into the host as part of this workflo
    [registry notifications](registry-notifications.md) for scope and contracts.
 3. Extend [process-local handles and EPROCESS.ObjectTable](process-handle-tables.md)
    beyond the bounded table model: inheritance, blocking rundown, and process-exit
-   device cleanup remain follow-on work.
+   device cleanup remain follow-on work. Class-5
+   [process/thread snapshots](process-information-snapshots.md) now derive handle
+   counts and owned thread records from those models; complete accounting and
+   scheduler fidelity remain separate work.
 4. Memory invariants across MMU, PFN, MDL, allocations, and guest-visible metadata.
 5. Build-pinned CI verification contracts, fixtures, and policy behavior.
 6. Versioned firmware/storage machine profiles and explicit device/IRP completion.
