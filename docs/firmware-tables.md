@@ -2,7 +2,8 @@
 
 This pass implements `Nt/ZwQuerySystemInformation` class 76 for the RSMB raw
 SMBIOS provider. It is separate from the existing UEFI/NVRAM variable store.
-Implementation and validation are in progress; final results follow below.
+The model, kernel/native conformance fixtures, regressions, and bounded VGK
+capture passed. VGK's previously unsupported RSMB request now succeeds.
 
 ## Investigation
 
@@ -121,7 +122,55 @@ class-76 result is 228 bytes. Eleven known native loader warnings were matched
 against exact, count-bounded patterns before the first native firmware query.
 They remain environment limitations, not successful subsystem implementations.
 
-A bounded VGK capture against the implemented provider is pending.
+Independent production/model and final fixture reviews found no material issues.
+Mixed-permission page-crossing buffers, arbitrary concurrent mapping changes,
+and ARM64 runtime behavior remain outside the focused guest validation.
+
+## Target capture
+
+The kernel-only WHP validation capture is
+`build-conformance/kernel-20260927-141600-534/`, using generic commit `0b34a00`
+plus the existing local-only compatibility stub at lab commit
+`067370aeec46a3dec0d4180feb5b092c67f3e469`. Frozen lab executable SHA-256:
+`CC1BDE0F03837380585B9A117F87C3152252370666EB48D641DF231727C07957`.
+The generic checkout and executable were restored after launch.
+
+At stdout line 9553, VGK's observed RSMB Get/table-0 request succeeds with total
+required length 228. DriverEntry returns STATUS_SUCCESS at line 9585,
+14:16:10.925. The earlier unsupported-class-76 warning and subsequent `E000017F`
+diagnostic are absent. This establishes that the exercised API path now succeeds;
+it does not establish full inventory conformance or unobserved consumer behavior.
+
+The capture completed 210.0361049 seconds and was deliberately stopped at the
+configured limit; exit -1 reflects that supervisor stop. Timer expiration occurs
+at 14:19:02.406 and the first true read at 14:19:03.363. There are 115 false reads
+followed by 19 true reads, confirming continued execution beyond expiration.
+
+Nine successful process snapshots retain the expected startup transitions and
+settle at 41 processes, five modeled threads, and four handles. Seven audit
+sweeps produce 287 process lookups, 245 attachments, 245 detaches, and 245 rundown
+releases. Every release reports zero remaining references and all parsed
+attachments balance.
+
+Independent full-log inspection found 141 dispatched and 141 handled exceptions,
+zero unhandled exceptions, zero API faults/callback failures/executed missing
+APIs, and no new normalized warning messages relative to the prior capture.
+The three known optional IRQL hook-symbol setup errors remain. These results
+validate this bounded workload, not complete hardware/debugger fidelity.
+
+The logged pool footprint at capture end is 1,823 allocations / 24,801,152 bytes,
+matching the prior capture's final footprint. All surviving allocations originate
+before DriverEntry returns. This reconstruction covers only logged pool APIs,
+not all allocation sources or shutdown cleanup; no host-resource sampling was
+performed in this short run.
+
+`verification.json` records matching post-run driver, lab executable, kernel,
+and CI hashes, empty stderr, restored generic executable, and no remaining
+emulator process. Stdout SHA-256:
+`2302B618DF75A67AC77BE14C18814FAAA2D28A287BB433C003F42485B6B361E1`.
+Detailed observations are in the capture's `worker-analysis.json`,
+`resource-analysis.json`, and `snapshot-analysis.json` sidecars. The kernel-only
+scope deliberately excludes `vgc.exe` and user-service fidelity.
 
 Reproduction commands (guest images run only through the emulator):
 
