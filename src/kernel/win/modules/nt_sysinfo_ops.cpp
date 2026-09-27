@@ -767,6 +767,21 @@ void modules::register_ntoskrnl_sysinfo_ops(win_kernel_state& state, proc_module
 			return STATUS_NOT_IMPLEMENTED;
 		}
 
+		case 76:
+			// Record the input-only request header before selecting a bounded provider.
+			if (system_information && length >= 16)
+			{
+				try
+				{
+					std::uint32_t header[4]{};
+					space.read_mem(system_information, header, sizeof(header));
+					THREAD_LOG_INFO("SystemFirmwareTableInformation probe: provider=0x{:08X} action={} table=0x{:08X} capacity={} length={}",
+						header[0], header[1], header[2], header[3], length);
+				}
+				catch (...) { THREAD_LOG_WARN("SystemFirmwareTableInformation probe: unreadable header"); }
+			}
+			return STATUS_INVALID_INFO_CLASS;
+
 		default:
 			THREAD_LOG_WARN("NtQuerySystemInformation: unhandled class {}",
 				system_information_class);
