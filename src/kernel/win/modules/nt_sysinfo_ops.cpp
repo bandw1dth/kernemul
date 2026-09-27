@@ -16,9 +16,11 @@
 #include <string>
 #include <string_view>
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstring>
 #include <limits>
+#include <new>
 #include <vector>
 
 namespace
@@ -32,6 +34,7 @@ enum system_information_class : std::uint32_t
 	system_numa_processor_map       = 55,
 	system_module_information       = 0x0B,
 	system_module_information_ex    = 0x4D,
+	system_firmware_table_information = 76,
 	system_kernel_debugger_information    = 0x23,
 	system_kernel_debugger_information_ex = 0x42,
 	system_code_integrity_policy_information = 0x5A,
@@ -767,20 +770,62 @@ void modules::register_ntoskrnl_sysinfo_ops(win_kernel_state& state, proc_module
 			return STATUS_NOT_IMPLEMENTED;
 		}
 
-		case 76:
-			// Record the input-only request header before selecting a bounded provider.
-			if (system_information && length >= 16)
+		case system_firmware_table_information:
+		{
+			try
 			{
-				try
+				const bool user = st->handle_mode(cpu) != 0;
+				// Preflight the entire declared output and ReturnLength before any
+				// write. Zero length deliberately ignores the output pointer.
+				if (return_length && !process_output_writable(space, return_length.address(), sizeof(std::uint32_t), user))
+					return STATUS_ACCESS_VIOLATION;
+				if (user && length && (system_information & 3))
+					return static_cast<NTSTATUS>(0x80000002); // STATUS_DATATYPE_MISALIGNMENT
+				if (!process_output_writable(space, system_information, length, user))
+					return STATUS_ACCESS_VIOLATION;
+				// Bounded policy: reject aliases between the two output destinations.
+				// Ranges are validated above; subtraction avoids end-address overflow.
+				if (return_length && length
+					&& (return_length.address() >= system_information
+						? return_length.address() - system_information < length
+						: system_information - return_length.address() < sizeof(std::uint32_t)))
+					return STATUS_INVALID_PARAMETER;
+				const auto caller = user ? st->current_process(cpu) : nullptr;
+				if (user && ((return_length && !process_memory_copy::capture(caller, space,
+					return_length.address(), nullptr, sizeof(std::uint32_t), true, true))
+					|| !process_memory_copy::capture(caller, space, system_information, nullptr, length, true, true)))
+					return STATUS_ACCESS_VIOLATION;
+
+				std::array<std::uint32_t, 4> header{};
+				static_assert(sizeof(header) == win::firmware_tables::header_size);
+				if (length >= win::firmware_tables::header_size)
 				{
-					std::uint32_t header[4]{};
-					space.read_mem(system_information, header, sizeof(header));
-					THREAD_LOG_INFO("SystemFirmwareTableInformation probe: provider=0x{:08X} action={} table=0x{:08X} capacity={} length={}",
-						header[0], header[1], header[2], header[3], length);
+					// Capture the input header once; never allocate using caller sizes.
+					if (user)
+					{
+						if (!process_memory_copy::capture(caller, space, system_information,
+							header.data(), sizeof(header), false, true)) return STATUS_ACCESS_VIOLATION;
+					}
+					else space.read_mem(system_information, header.data(), sizeof(header));
 				}
-				catch (...) { THREAD_LOG_WARN("SystemFirmwareTableInformation probe: unreadable header"); }
+				const auto answer = st->firmware_tables.query(header[0], header[1], header[2], length);
+				THREAD_LOG_INFO("SystemFirmwareTableInformation: provider=0x{:08X} action={} table=0x{:08X} "
+					"outer={} inputCapacity={} required={} status=0x{:08X}; {}",
+					header[0], header[1], header[2], length, header[3], answer.required, answer.status,
+					win::firmware_tables::synthetic_provenance);
+				// Preserve provider/action/table and untouched buffer tails, including
+				// every header field on unsupported provider/action and short headers.
+				if (answer.write_length)
+					space.write_mem(system_information + 12, answer.table_buffer_length);
+				if (!answer.payload.empty())
+					space.write_mem(system_information + win::firmware_tables::header_size,
+						answer.payload.data(), answer.payload.size());
+				if (return_length) space.write_mem(return_length.address(), answer.required);
+				return static_cast<NTSTATUS>(answer.status);
 			}
-			return STATUS_INVALID_INFO_CLASS;
+			catch (const std::bad_alloc&) { return STATUS_INSUFFICIENT_RESOURCES; }
+			catch (...) { return STATUS_ACCESS_VIOLATION; }
+		}
 
 		default:
 			THREAD_LOG_WARN("NtQuerySystemInformation: unhandled class {}",

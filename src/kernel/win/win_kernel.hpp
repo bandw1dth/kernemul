@@ -11,6 +11,7 @@
 #include "boot_seed.hpp"
 #include "registry.hpp"
 #include "firmware.hpp"
+#include "firmware_tables.hpp"
 #include "registry_notify.hpp"
 #include "ob_notify.hpp"
 #include "filesystem.hpp"
@@ -77,6 +78,7 @@ struct win_kernel_state : kernel_state
 	win_pool pool;
 	win_registry reg;
 	const win::firmware::store firmware = win::firmware::synthetic_uefi();
+	const win::firmware_tables::store firmware_tables{firmware.type() == win::firmware::mode::uefi};
 	win_filesystem fs;
 	std::shared_ptr<win_kernel_proc> sys_proc;
 	loaded_module_list_t loaded_module_list;

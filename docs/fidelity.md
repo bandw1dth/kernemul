@@ -82,6 +82,8 @@ versions. Do not load the unsigned fixture into the host as part of this workflo
 4. Memory invariants across MMU, PFN, MDL, allocations, and guest-visible metadata.
 5. Build-pinned CI verification contracts, fixtures, and policy behavior.
 6. Versioned firmware/storage machine profiles and explicit device/IRP completion.
+   The bounded [firmware-table provider](firmware-tables.md) adds a deterministic
+   partial RSMB inventory; ACPI/FIRM and full SMBIOS platform data remain separate.
 
 Use Microsoft contracts and small differential tests first. Consult matching PDBs
 and exact-build disassembly when an observed behavior is undocumented. ReactOS is
